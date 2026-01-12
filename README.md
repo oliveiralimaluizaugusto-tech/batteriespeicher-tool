@@ -18,6 +18,27 @@ Das Tool bietet drei Analysemodi für verschiedene Anwendungsfälle:
 
 ---
 
+## 📋 Changelog v3 (Januar 2026)
+
+### Modus A - Verbesserte Wirtschaftlichkeitsrechnung
+
+**Realistische Erlösberechnung:**
+- FCR-Erlös Default erhöht auf 160.000 €/MW/Jahr (vorher: 120.000)
+- aFRR-Erlös Default erhöht auf 70.000 €/MW/Jahr (vorher: 50.000)
+- Arbitrage-Erlös Default erhöht auf 35.000 €/MWh/Jahr (vorher: 15.000)
+
+**Verbesserte Arbitrage-Berechnung:**
+- 1.5-2 Zyklen pro Tag statt max. 1
+- Intraday-Aufschlag von 35% berücksichtigt
+- Default-Spread von 65 €/MWh (vorher: 30 €/MWh)
+
+**Neue Visualisierung:**
+- Erlösaufteilung als Tortendiagramm
+- Detaillierte Erlöstabelle mit Brutto/Netto
+- Marktvergleich (konservativ/durchschnitt/optimistisch)
+
+---
+
 ## 🚀 Live-Demo
 
 **[➡️ App auf Streamlit Cloud öffnen](https://batteriespeicher-tool.streamlit.app)**
@@ -50,6 +71,11 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 
 ## 📊 Benötigte Eingabedaten
 
+### Modus A - Wirtschaftlichkeit
+- Optional: Day-Ahead-Preisprofil (CSV)
+- Optional: FCR-Preise (CSV)
+- Oder: Verwendung von Benchmark-Werten
+
 ### Modus B - Peak Shaving
 - **Lastprofil** (CSV/Excel): Zeitreihe mit Leistungswerten in kW oder MW
 - Format: Spalte 1 = Zeitstempel, Spalte 2 = Leistung
@@ -73,6 +99,7 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 - Annuitätenmethode für CAPEX
 - Berücksichtigung von OPEX (% von CAPEX)
 - Konfigurierbare Zinssätze und Lebensdauern
+- NPV, IRR, Amortisationszeit, LCOS
 
 ---
 
@@ -92,6 +119,8 @@ batteriespeicher-tool/
 - [PyPSA Dokumentation](https://pypsa.readthedocs.io/)
 - [Streamlit Dokumentation](https://docs.streamlit.io/)
 - [HiGHS Solver](https://highs.dev/)
+- Frontier Economics: Batteriespeicher-Marktstudien
+- Aurora Energy Research: European Battery Storage Outlook
 
 ---
 

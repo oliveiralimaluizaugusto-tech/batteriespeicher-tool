@@ -607,42 +607,83 @@ def optimize_storage_size(generation_profile, max_grid_power, price_profile,
     return pd.DataFrame(results)
 
 
-def estimate_arbitrage_revenue(capacity_mwh, power_mw, price_profile, efficiency, cycles_available):
+def estimate_arbitrage_revenue(capacity_mwh, power_mw, price_profile, efficiency, cycles_available,
+                               include_intraday=True, daily_cycles_target=1.5):
     """
     Schätzt die Arbitrage-Erlöse basierend auf Preisspreads.
     
-    Vereinfachte Berechnung:
-    - Identifiziert tägliche Preisspreads
-    - Berechnet mögliche Zyklen und Erlöse
+    Realistische Berechnung für 2024/2025:
+    - Day-Ahead Spreads (P90-P10 oder Max-Min)
+    - Intraday-Aufschlag (typisch +30-50% auf Day-Ahead)
+    - 1.5-2 Zyklen pro Tag realistisch für moderne Speicher
+    
+    Args:
+        capacity_mwh: Speicherkapazität in MWh
+        power_mw: Speicherleistung in MW
+        price_profile: Preiszeitreihe (optional)
+        efficiency: Roundtrip-Wirkungsgrad
+        cycles_available: Verfügbare Zyklen (Lebensdauer-Limit)
+        include_intraday: Intraday-Erlöse einbeziehen (Default: True)
+        daily_cycles_target: Ziel-Zyklen pro Tag (Default: 1.5)
+    
+    Returns:
+        Geschätzte jährliche Arbitrage-Erlöse in €
     """
-    if price_profile is None or len(price_profile) == 0:
+    if capacity_mwh <= 0 or power_mw <= 0:
         return 0
     
-    # Tägliche Preisspreads berechnen
-    prices = price_profile.values if hasattr(price_profile, 'values') else price_profile
+    # Nutzbare Kapazität (80% der Nennkapazität typisch)
+    usable_capacity = capacity_mwh * (0.9 - 0.1)
     
-    # Gruppiere nach Tagen (96 Werte pro Tag bei 15-min-Auflösung)
-    n_days = len(prices) // 96
-    daily_spreads = []
+    # E/P-Verhältnis bestimmt max. Zyklen pro Tag
+    ep_ratio = capacity_mwh / power_mw if power_mw > 0 else 2
+    # Bei 2h Speicher: theoretisch bis zu 4-5 Zyklen möglich, praktisch 1.5-2.5
+    max_physical_cycles = 24 / (ep_ratio * 2)  # Laden + Entladen
     
-    for day in range(n_days):
-        day_prices = prices[day * 96:(day + 1) * 96]
-        spread = np.max(day_prices) - np.min(day_prices)
-        daily_spreads.append(spread)
+    # Realistische tägliche Zyklen (marktgetrieben)
+    daily_cycles = min(daily_cycles_target, max_physical_cycles, 2.5)  # Max 2.5 Zyklen/Tag
     
-    avg_spread = np.mean(daily_spreads) if daily_spreads else 30  # Default 30 €/MWh
+    # Jährliche Zyklen (begrenzt durch Batterielebensdauer)
+    annual_cycles = min(365 * daily_cycles, cycles_available)
     
-    # Usable capacity
-    usable_capacity = capacity_mwh * (0.9 - 0.1)  # SoC-Bereich
+    # Preisspreads berechnen
+    if price_profile is not None and len(price_profile) > 96:
+        prices = price_profile.values if hasattr(price_profile, 'values') else price_profile
+        
+        # P90-P10 Spread (robuster als Max-Min)
+        p90 = np.percentile(prices, 90)
+        p10 = np.percentile(prices, 10)
+        avg_spread_da = p90 - p10
+        
+        # Tägliche Spreads für Variabilität
+        n_days = len(prices) // 96
+        daily_spreads = []
+        for day in range(min(n_days, 365)):
+            day_prices = prices[day * 96:(day + 1) * 96]
+            if len(day_prices) > 0:
+                spread = np.percentile(day_prices, 90) - np.percentile(day_prices, 10)
+                daily_spreads.append(spread)
+        
+        avg_spread_da = np.mean(daily_spreads) if daily_spreads else avg_spread_da
+    else:
+        # Default-Spread für 2024/2025 Marktbedingungen (deutlich höher als früher)
+        avg_spread_da = 65  # €/MWh Day-Ahead Spread (P90-P10)
     
-    # Maximale Zyklen pro Jahr (begrenzt durch verfügbare Kapazität)
-    max_daily_cycles = min(1, power_mw * 24 / usable_capacity)  # Max 1 Zyklus pro Tag
-    annual_cycles = min(365 * max_daily_cycles, cycles_available)
+    # Intraday-Aufschlag (Intraday-Handel bringt typisch 30-50% mehr)
+    if include_intraday:
+        intraday_factor = 1.35  # +35% durch Intraday-Optimierung
+    else:
+        intraday_factor = 1.0
+    
+    effective_spread = avg_spread_da * intraday_factor
     
     # Erlös pro Zyklus
-    revenue_per_cycle = usable_capacity * avg_spread * efficiency
+    revenue_per_cycle = usable_capacity * effective_spread * efficiency
     
-    return annual_cycles * revenue_per_cycle
+    # Gesamterlös
+    total_revenue = annual_cycles * revenue_per_cycle
+    
+    return total_revenue
 
 
 def optimize_capacity_allocation(storage_capacity_mwh, storage_power_mw, 
@@ -654,6 +695,10 @@ def optimize_capacity_allocation(storage_capacity_mwh, storage_power_mw,
     FCR-Anforderungen:
     - Symmetrische Vorhaltung (positiv und negativ)
     - 30-Minuten-Lieferfähigkeit bei vollem Abruf
+    
+    Aktualisiert für 2024/2025 Marktbedingungen:
+    - Höhere Default-Preise
+    - Realistische Zyklenzahlen
     
     Returns:
         dict mit optimaler Aufteilung und Erlösen
@@ -667,9 +712,9 @@ def optimize_capacity_allocation(storage_capacity_mwh, storage_power_mw,
     max_fcr_power = usable_capacity / 0.5 / 2  # 0.5h * 2 (symmetrisch)
     max_fcr_power = min(max_fcr_power, storage_power_mw)
     
-    # Durchschnittliche Preise
-    avg_fcr_price = fcr_prices.mean() if fcr_prices is not None and len(fcr_prices) > 0 else 15  # €/MW/h
-    avg_afrr_price = afrr_prices.mean() if afrr_prices is not None and len(afrr_prices) > 0 else 8  # €/MW/h
+    # Durchschnittliche Preise (aktualisiert für 2024/2025)
+    avg_fcr_price = fcr_prices.mean() if fcr_prices is not None and len(fcr_prices) > 0 else 18  # €/MW/h (war: 15)
+    avg_afrr_price = afrr_prices.mean() if afrr_prices is not None and len(afrr_prices) > 0 else 10  # €/MW/h (war: 8)
     
     # Iteriere über verschiedene Aufteilungen
     for fcr_share in np.arange(0, 1.01, 0.1):
@@ -696,14 +741,16 @@ def optimize_capacity_allocation(storage_capacity_mwh, storage_power_mw,
             fcr_revenue = fcr_power * avg_fcr_price * hours_per_year
             afrr_revenue = afrr_power * avg_afrr_price * hours_per_year
             
-            # Arbitrage-Erlöse
-            if price_profile is not None and arbitrage_capacity > 0:
+            # Arbitrage-Erlöse (verbesserte Berechnung)
+            if arbitrage_capacity > 0:
                 arbitrage_revenue = estimate_arbitrage_revenue(
                     capacity_mwh=arbitrage_capacity / (soc_max - soc_min),
                     power_mw=arbitrage_power,
                     price_profile=price_profile,
                     efficiency=efficiency,
-                    cycles_available=500  # Annahme
+                    cycles_available=700,  # Erhöht von 500 auf 700 Zyklen
+                    include_intraday=True,
+                    daily_cycles_target=1.5
                 )
             else:
                 arbitrage_revenue = 0
@@ -1384,62 +1431,80 @@ def show_mode_a_step2():
     
     if estimation_method == "Benchmark-Werte (Branchendurchschnitt)":
         st.markdown("---")
-        st.markdown("#### 📈 Benchmark-Erlöse (Marktdurchschnitt 2023/2024)")
+        st.markdown("#### 📈 Benchmark-Erlöse (Marktdurchschnitt 2024/2025)")
         
         st.markdown("""
         <div class="info-box">
-            <strong>Quelle:</strong> Durchschnittswerte aus Marktstudien und veröffentlichten Daten 
-            von Batteriespeicher-Projekten in Deutschland.
+            <strong>Quelle:</strong> Durchschnittswerte aus Marktstudien (Frontier Economics, Aurora Energy Research) 
+            und veröffentlichten Daten von Batteriespeicher-Projekten in Deutschland. Speicher amortisieren sich 
+            aktuell typischerweise in <strong>3-5 Jahren</strong>.
         </div>
         """, unsafe_allow_html=True)
         
-        # Benchmark-Werte (basierend auf Marktdaten)
+        # Benchmark-Werte (basierend auf aktuellen Marktdaten 2024/2025)
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("##### Anpassbare Benchmark-Werte")
+            st.markdown("##### ⚡ Regelleistung (Haupterlös)")
             
-            # Spezifische Erlöse (€/MW/Jahr für Leistung, €/MWh/Jahr für Kapazität)
+            # FCR ist der Haupterlösträger für Batteriespeicher
             revenue_fcr = st.number_input(
                 "FCR-Erlös (€/MW/Jahr)",
-                min_value=50000,
-                max_value=250000,
-                value=120000,
-                step=5000,
-                help="Typisch: 100.000 - 150.000 €/MW/Jahr (stark schwankend)"
+                min_value=80000,
+                max_value=300000,
+                value=160000,
+                step=10000,
+                help="Typisch 2024: 130.000-200.000 €/MW/Jahr. FCR-Preise schwanken stark (10-30 €/MW/h)."
             )
             
             revenue_afrr = st.number_input(
                 "aFRR-Erlös (€/MW/Jahr)",
-                min_value=20000,
-                max_value=100000,
-                value=50000,
+                min_value=30000,
+                max_value=150000,
+                value=70000,
                 step=5000,
-                help="Typisch: 40.000 - 70.000 €/MW/Jahr"
+                help="Typisch: 50.000-90.000 €/MW/Jahr (Leistungspreis + Arbeitspreis)"
             )
+            
+            st.markdown("##### 💹 Arbitrage (Day-Ahead + Intraday)")
             
             revenue_arbitrage = st.number_input(
                 "Arbitrage-Erlös (€/MWh/Jahr)",
-                min_value=5000,
-                max_value=50000,
-                value=15000,
-                step=1000,
-                help="Typisch: 10.000 - 25.000 €/MWh/Jahr (abhängig von Preisvolatilität)"
+                min_value=10000,
+                max_value=80000,
+                value=35000,
+                step=2500,
+                help="Typisch 2024: 25.000-50.000 €/MWh/Jahr bei 1.5-2 Zyklen/Tag und 50-80 €/MWh Spread"
             )
+            
+            st.markdown("""
+            <div class="warning-box">
+                <strong>💡 Tipp:</strong> Bei hoher Preisvolatilität (wie 2022/2023) können 
+                Arbitrage-Erlöse deutlich höher sein (bis 80.000 €/MWh/Jahr).
+            </div>
+            """, unsafe_allow_html=True)
         
         with col2:
-            st.markdown("##### Marktanteile (typische Aufteilung)")
+            st.markdown("##### 📊 Marktanteile (typische Aufteilung)")
             
             st.markdown("""
             Der Direktvermarkter optimiert die Aufteilung dynamisch.
-            Für die Wirtschaftlichkeitsrechnung verwenden wir typische Durchschnittswerte:
+            **FCR ist typischerweise der Haupterlösträger** (50-70% der Erlöse).
             """)
             
-            share_fcr = st.slider("FCR-Anteil (%)", 0, 100, 50, key="share_fcr_a") / 100
-            share_afrr = st.slider("aFRR-Anteil (%)", 0, 100 - int(share_fcr*100), 20, key="share_afrr_a") / 100
+            share_fcr = st.slider("FCR-Anteil (%)", 0, 100, 55, key="share_fcr_a") / 100
+            share_afrr = st.slider("aFRR-Anteil (%)", 0, 100 - int(share_fcr*100), 15, key="share_afrr_a") / 100
             share_arbitrage = 1 - share_fcr - share_afrr
             
             st.info(f"Verbleibender Arbitrage-Anteil: {share_arbitrage*100:.0f}%")
+            
+            # Info-Box zur Marktaufteilung
+            st.markdown("""
+            **Typische Aufteilung:**
+            - FCR: 50-70% (höchste €/MW-Erlöse)
+            - aFRR: 10-25% (zusätzliche Erlöse)
+            - Arbitrage: 20-40% (nutzt verbleibende Kapazität)
+            """)
         
         # Erlöse berechnen
         annual_revenue_fcr = revenue_fcr * storage_power * share_fcr
@@ -1529,24 +1594,37 @@ def show_mode_a_step2():
         if st.session_state.get('price_profile_a') is not None:
             prices = st.session_state.price_profile_a
             
-            # Arbitrage-Erlös schätzen
+            # Arbitrage-Erlös schätzen (verbessert)
             price_spread = np.percentile(prices, 90) - np.percentile(prices, 10)
             usable_capacity = storage_capacity * (st.session_state.get('soc_max_a_val', 0.9) - 
                                                    st.session_state.get('soc_min_a_val', 0.1))
-            daily_cycles = min(2, storage_power / usable_capacity)
-            annual_cycles = daily_cycles * 365
-            annual_revenue_arb = price_spread * annual_cycles * usable_capacity * efficiency
             
-            # FCR-Erlös
+            # Realistische Zyklen (1.5-2 pro Tag)
+            ep_ratio = storage_capacity / storage_power if storage_power > 0 else 2
+            daily_cycles = min(2.0, 24 / (ep_ratio * 2))  # Max 2 Zyklen/Tag
+            daily_cycles = max(1.5, daily_cycles)  # Min 1.5 Zyklen/Tag
+            annual_cycles = daily_cycles * 365
+            
+            # Intraday-Aufschlag berücksichtigen (+35%)
+            intraday_factor = 1.35
+            effective_spread = price_spread * intraday_factor
+            
+            annual_revenue_arb = effective_spread * annual_cycles * usable_capacity * efficiency
+            
+            # FCR-Erlös (erhöhter Default-Preis)
             if st.session_state.get('fcr_prices_a') is not None:
                 fcr_mean = st.session_state.fcr_prices_a.mean()
             else:
-                fcr_mean = st.session_state.get('fcr_default_a', 15)
+                fcr_mean = st.session_state.get('fcr_default_a', 18)  # Erhöht von 15 auf 18
             
             hours_per_year = len(prices) / 4 if len(prices) > 8760 else 8760
-            annual_revenue_fcr = fcr_mean * storage_power * hours_per_year * 0.5  # 50% FCR-Anteil
+            annual_revenue_fcr = fcr_mean * storage_power * hours_per_year * 0.55  # 55% FCR-Anteil (erhöht)
             
-            total_annual_revenue = annual_revenue_fcr + annual_revenue_arb
+            # aFRR-Erlös (neu hinzugefügt)
+            afrr_mean = 10  # €/MW/h Default
+            annual_revenue_afrr = afrr_mean * storage_power * hours_per_year * 0.15  # 15% aFRR-Anteil
+            
+            total_annual_revenue = annual_revenue_fcr + annual_revenue_afrr + annual_revenue_arb
             
             # Provision
             marketer_fee = st.number_input("Provision Direktvermarkter (%)", 5, 30, 15, key="marketer_fee_a")
@@ -1555,12 +1633,23 @@ def show_mode_a_step2():
             st.session_state.annual_revenue_a = net_revenue
             st.session_state.revenue_details_a = {
                 'fcr': annual_revenue_fcr,
-                'afrr': 0,
+                'afrr': annual_revenue_afrr,
                 'arbitrage': annual_revenue_arb,
                 'total_brutto': total_annual_revenue,
                 'marketer_fee': marketer_fee,
                 'total_netto': net_revenue
             }
+            
+            # Info über die Berechnung
+            st.markdown(f"""
+            <div class="info-box">
+                <strong>Berechnungsgrundlage:</strong><br>
+                • Day-Ahead Spread (P90-P10): {price_spread:.1f} €/MWh<br>
+                • Mit Intraday-Optimierung (+35%): {effective_spread:.1f} €/MWh<br>
+                • Geschätzte Zyklen/Tag: {daily_cycles:.1f}<br>
+                • FCR-Preis: {fcr_mean:.1f} €/MW/h
+            </div>
+            """, unsafe_allow_html=True)
     
     # Erlösübersicht anzeigen
     if st.session_state.get('revenue_details_a'):
@@ -1769,6 +1858,107 @@ def show_mode_a_step3():
         
         Das Projekt erreicht unter den gegebenen Annahmen keine positive Wirtschaftlichkeit.
         """)
+    
+    st.markdown("---")
+    
+    # NEUE SEKTION: Erlösaufschlüsselung
+    st.markdown("#### 📊 Erlösaufschlüsselung")
+    
+    # Erlösdetails aus Session State holen
+    rev_details = st.session_state.get('revenue_details_a', {})
+    
+    if rev_details:
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            # Tortendiagramm für Erlösanteile
+            fig_pie, ax_pie = plt.subplots(figsize=(8, 6))
+            
+            labels = []
+            sizes = []
+            colors_pie = []
+            
+            if rev_details.get('fcr', 0) > 0:
+                labels.append(f"FCR\n{rev_details['fcr']:,.0f} €")
+                sizes.append(rev_details['fcr'])
+                colors_pie.append('#3498db')
+            
+            if rev_details.get('afrr', 0) > 0:
+                labels.append(f"aFRR\n{rev_details['afrr']:,.0f} €")
+                sizes.append(rev_details['afrr'])
+                colors_pie.append('#2ecc71')
+            
+            if rev_details.get('arbitrage', 0) > 0:
+                labels.append(f"Arbitrage\n{rev_details['arbitrage']:,.0f} €")
+                sizes.append(rev_details['arbitrage'])
+                colors_pie.append('#f39c12')
+            
+            if sizes:
+                wedges, texts, autotexts = ax_pie.pie(
+                    sizes, 
+                    labels=labels, 
+                    colors=colors_pie,
+                    autopct='%1.0f%%',
+                    startangle=90,
+                    explode=[0.02] * len(sizes),
+                    textprops={'fontsize': 10}
+                )
+                ax_pie.set_title('Erlösanteile (Brutto)', fontsize=12, fontweight='bold')
+            
+            st.pyplot(fig_pie)
+            plt.close()
+        
+        with col2:
+            # Detaillierte Erlöstabelle
+            st.markdown("##### 💰 Erlösübersicht")
+            
+            total_brutto = rev_details.get('total_brutto', 0)
+            marketer_fee = rev_details.get('marketer_fee', 15)
+            total_netto = rev_details.get('total_netto', 0)
+            
+            # Erlösrechnung als strukturierte Darstellung
+            st.markdown(f"""
+            | Position | Betrag |
+            |:---------|-------:|
+            | **FCR-Erlös** | {rev_details.get('fcr', 0):,.0f} € |
+            | **aFRR-Erlös** | {rev_details.get('afrr', 0):,.0f} € |
+            | **Arbitrage-Erlös** | {rev_details.get('arbitrage', 0):,.0f} € |
+            | **= Brutto-Erlös** | **{total_brutto:,.0f} €** |
+            | - Direktvermarkter ({marketer_fee}%) | -{total_brutto * marketer_fee / 100:,.0f} € |
+            | **= Netto-Erlös** | **{total_netto:,.0f} €/Jahr** |
+            """)
+            
+            # Spezifische Kennzahlen
+            st.markdown("##### 📈 Kennzahlen")
+            
+            col_k1, col_k2 = st.columns(2)
+            with col_k1:
+                if storage_capacity > 0:
+                    specific_mwh = total_netto / storage_capacity
+                    st.metric("€/MWh/Jahr", f"{specific_mwh:,.0f}")
+            with col_k2:
+                if storage_power > 0:
+                    specific_mw = total_netto / storage_power
+                    st.metric("€/MW/Jahr", f"{specific_mw:,.0f}")
+        
+        # Marktvergleich
+        st.markdown("---")
+        st.markdown("##### 🏆 Marktvergleich")
+        
+        benchmark_low = 80000 * storage_power  # Konservativ
+        benchmark_mid = 130000 * storage_power  # Durchschnitt
+        benchmark_high = 200000 * storage_power  # Optimistisch
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            delta_low = ((total_netto / benchmark_low) - 1) * 100 if benchmark_low > 0 else 0
+            st.metric("vs. Konservativ", f"{benchmark_low:,.0f} €", f"{delta_low:+.0f}%")
+        with col2:
+            delta_mid = ((total_netto / benchmark_mid) - 1) * 100 if benchmark_mid > 0 else 0
+            st.metric("vs. Durchschnitt", f"{benchmark_mid:,.0f} €", f"{delta_mid:+.0f}%")
+        with col3:
+            delta_high = ((total_netto / benchmark_high) - 1) * 100 if benchmark_high > 0 else 0
+            st.metric("vs. Optimistisch", f"{benchmark_high:,.0f} €", f"{delta_high:+.0f}%")
     
     st.markdown("---")
     
