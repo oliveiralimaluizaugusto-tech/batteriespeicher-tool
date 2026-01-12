@@ -1802,9 +1802,13 @@ def show_mode_a_step3():
             payback = i
             break
     
-    # LCOE berechnen (Levelized Cost of Storage)
-    total_energy_discharged = sum([storage_capacity * 1000 * 365 * 1.5 * ((1 - capacity_degradation) ** y) 
-                                   for y in range(calendar_life)])  # ~1.5 Zyklen/Tag
+    # LCOS berechnen (Levelized Cost of Storage)
+    soc_min_val = st.session_state.get('soc_min_a_val', 0.10)
+    soc_max_val = st.session_state.get('soc_max_a_val', 0.90)
+    usable_capacity_factor = soc_max_val - soc_min_val  # Nutzbare Kapazität (z.B. 0.8 = 80%)
+    
+    total_energy_discharged = sum([storage_capacity * 1000 * usable_capacity_factor * 365 * 1.5 * ((1 - capacity_degradation) ** y) 
+                                   for y in range(calendar_life)])  # ~1.5 Zyklen/Tag, nutzbare Kapazität
     total_costs_discounted = sum([(annual_opex) / ((1 + discount_rate) ** y) 
                                   for y in range(1, calendar_life + 1)]) + total_capex
     lcos = total_costs_discounted / total_energy_discharged * 1000 if total_energy_discharged > 0 else 0
@@ -1943,22 +1947,53 @@ def show_mode_a_step3():
         
         # Marktvergleich
         st.markdown("---")
-        st.markdown("##### 🏆 Marktvergleich")
+        st.markdown("##### 🏆 Marktvergleich: Wo liegt Ihr Projekt?")
         
         benchmark_low = 80000 * storage_power  # Konservativ
         benchmark_mid = 130000 * storage_power  # Durchschnitt
         benchmark_high = 200000 * storage_power  # Optimistisch
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            delta_low = ((total_netto / benchmark_low) - 1) * 100 if benchmark_low > 0 else 0
-            st.metric("vs. Konservativ", f"{benchmark_low:,.0f} €", f"{delta_low:+.0f}%")
-        with col2:
-            delta_mid = ((total_netto / benchmark_mid) - 1) * 100 if benchmark_mid > 0 else 0
-            st.metric("vs. Durchschnitt", f"{benchmark_mid:,.0f} €", f"{delta_mid:+.0f}%")
-        with col3:
-            delta_high = ((total_netto / benchmark_high) - 1) * 100 if benchmark_high > 0 else 0
-            st.metric("vs. Optimistisch", f"{benchmark_high:,.0f} €", f"{delta_high:+.0f}%")
+        # Balkendiagramm für übersichtlichen Vergleich
+        fig_bench, ax_bench = plt.subplots(figsize=(10, 4))
+        
+        categories = ['Konservativ\n(80k €/MW)', 'Durchschnitt\n(130k €/MW)', 
+                     'Ihr Projekt', 'Optimistisch\n(200k €/MW)']
+        values = [benchmark_low, benchmark_mid, total_netto, benchmark_high]
+        colors_bench = ['#95a5a6', '#3498db', '#2ecc71', '#f39c12']
+        
+        bars = ax_bench.barh(categories, values, color=colors_bench, height=0.6)
+        
+        # Werte an Balken anzeigen
+        for bar, val in zip(bars, values):
+            ax_bench.text(val + max(values)*0.02, bar.get_y() + bar.get_height()/2, 
+                         f'{val:,.0f} €', va='center', fontsize=10)
+        
+        # "Ihr Projekt" Balken hervorheben
+        bars[2].set_edgecolor('#27ae60')
+        bars[2].set_linewidth(3)
+        
+        ax_bench.set_xlabel('Jährlicher Netto-Erlös (€)')
+        ax_bench.set_title('Einordnung im Marktvergleich', fontweight='bold')
+        ax_bench.set_xlim(0, max(values) * 1.25)
+        ax_bench.grid(True, alpha=0.3, axis='x')
+        
+        # Hintergrund für "guten" Bereich
+        ax_bench.axvspan(benchmark_mid, benchmark_high, alpha=0.1, color='green', 
+                        label='Guter Bereich')
+        
+        plt.tight_layout()
+        st.pyplot(fig_bench)
+        plt.close()
+        
+        # Textuelle Einordnung
+        if total_netto >= benchmark_high:
+            st.success("🏆 **Hervorragend!** Ihr Projekt liegt über dem optimistischen Benchmark.")
+        elif total_netto >= benchmark_mid:
+            st.success("✅ **Gut!** Ihr Projekt liegt im oberen Marktbereich (zwischen Durchschnitt und Optimistisch).")
+        elif total_netto >= benchmark_low:
+            st.info("📊 **Solide.** Ihr Projekt liegt im mittleren Marktbereich (zwischen Konservativ und Durchschnitt).")
+        else:
+            st.warning("⚠️ **Unter Marktdurchschnitt.** Prüfen Sie die Annahmen oder Erlösoptimierung.")
     
     st.markdown("---")
     
