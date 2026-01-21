@@ -295,6 +295,89 @@ def load_csv_file(uploaded_file, expected_columns=None):
         return None
 
 
+def detect_time_resolution(data, index=None):
+    """
+    Erkennt automatisch die Zeitauflösung eines Datensatzes.
+    
+    Methoden:
+    1. Anzahl der Datenpunkte (35040 = 15-min, 8760 = stündlich)
+    2. Zeitdifferenz zwischen Datenpunkten (falls Index vorhanden)
+    
+    Args:
+        data: DataFrame, Series oder Array mit Zeitreihendaten
+        index: Optional - DatetimeIndex für präzise Erkennung
+    
+    Returns:
+        dict mit:
+        - 'dt': Zeitschritt in Stunden (0.25 für 15-min, 1.0 für stündlich)
+        - 'resolution': String-Beschreibung ('15-Minuten' oder 'Stündlich')
+        - 'steps_per_day': Schritte pro Tag (96 oder 24)
+        - 'steps_per_year': Erwartete Schritte pro Jahr
+    """
+    # Anzahl der Datenpunkte ermitteln
+    if hasattr(data, '__len__'):
+        n = len(data)
+    else:
+        n = data
+    
+    # Methode 1: Basierend auf Datenpunktanzahl
+    # 15-Minuten: 35040 (365 * 96), 35136 (366 * 96)
+    # Stündlich: 8760 (365 * 24), 8784 (366 * 24)
+    
+    if n >= 34000 and n <= 36000:
+        # 15-Minuten-Auflösung
+        dt = 0.25
+        resolution = "15-Minuten"
+        steps_per_day = 96
+    elif n >= 8700 and n <= 8800:
+        # Stündliche Auflösung
+        dt = 1.0
+        resolution = "Stündlich"
+        steps_per_day = 24
+    else:
+        # Methode 2: Falls Index vorhanden, Zeitdifferenz berechnen
+        if index is not None and hasattr(index, 'to_series'):
+            try:
+                time_diff = index.to_series().diff().median()
+                minutes = time_diff.total_seconds() / 60
+                
+                if minutes <= 20:  # ~15 Minuten
+                    dt = 0.25
+                    resolution = "15-Minuten"
+                    steps_per_day = 96
+                elif minutes <= 70:  # ~60 Minuten
+                    dt = 1.0
+                    resolution = "Stündlich"
+                    steps_per_day = 24
+                else:
+                    # Unbekannte Auflösung - Default 15-min
+                    dt = 0.25
+                    resolution = f"Unbekannt ({minutes:.0f} min) - verwende 15-min"
+                    steps_per_day = 96
+            except:
+                # Fallback
+                dt = 0.25
+                resolution = "15-Minuten (Standard)"
+                steps_per_day = 96
+        else:
+            # Heuristik: Wenn n > 10000 -> 15-min, sonst stündlich
+            if n > 10000:
+                dt = 0.25
+                resolution = "15-Minuten (geschätzt)"
+                steps_per_day = 96
+            else:
+                dt = 1.0
+                resolution = "Stündlich (geschätzt)"
+                steps_per_day = 24
+    
+    return {
+        'dt': dt,
+        'resolution': resolution,
+        'steps_per_day': steps_per_day,
+        'steps_per_year': steps_per_day * 365
+    }
+
+
 def parse_datetime_column(series):
     """
     Versucht verschiedene Datumsformate zu parsen.
@@ -466,7 +549,9 @@ def calculate_curtailment(generation_profile, max_grid_power, storage_capacity_m
     soc_min_mwh = soc_min * storage_capacity_mwh
     soc_max_mwh = soc_max * storage_capacity_mwh
     
-    dt = 0.25  # 15 Minuten = 0.25 Stunden
+    # Zeitauflösung erkennen
+    time_res = detect_time_resolution(n)
+    dt = time_res['dt']
     
     for t in range(n):
         gen = generation_profile.iloc[t]
@@ -798,7 +883,10 @@ def calculate_peak_shaving(load_profile, target_limit, storage_power_mw,
     - Generator (pv_surplus): PV-Überschuss (falls vorhanden)
     """
     n = len(load_profile)
-    dt = 0.25  # 15 Minuten = 0.25 Stunden
+    
+    # Zeitauflösung erkennen
+    time_res = detect_time_resolution(n)
+    dt = time_res['dt']
     
     # Effizienz aufteilen (sqrt für Laden und Entladen)
     eta_charge = np.sqrt(efficiency)
@@ -954,7 +1042,10 @@ def optimize_peak_shaving_storage(load_profile, target_limit, efficiency, soc_mi
         dict mit optimaler Konfiguration und Ergebnissen
     """
     n = len(load_profile)
-    dt = 0.25
+    
+    # Zeitauflösung erkennen
+    time_res = detect_time_resolution(n)
+    dt = time_res['dt']
     
     eta_charge = np.sqrt(efficiency)
     eta_discharge = np.sqrt(efficiency)
@@ -2241,7 +2332,12 @@ def show_mode_b_step1():
                     values = values / 1000  # Umrechnung in MW
                 
                 st.session_state.load_profile = pd.Series(values, index=df.index)
-                st.success(f"✓ {len(df)} Datenpunkte geladen")
+                
+                # Zeitauflösung erkennen und speichern
+                time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                st.session_state.time_resolution_b = time_res
+                
+                st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
                 
                 with st.expander("Lastprofil-Vorschau"):
                     fig, ax = plt.subplots(figsize=(10, 3))
@@ -2383,8 +2479,10 @@ def show_mode_b_step1():
                     net_load = load.values - pv_used
                     pv_surplus = np.zeros(len(load))  # Kein Überschuss für Speicher vom Netz
                     
+                    # Zeitauflösung verwenden
+                    dt_b = st.session_state.get('time_resolution_b', {'dt': 0.25})['dt']
                     st.info(f"🔌 **Nulleinspeisung aktiv:** PV wird auf Eigenverbrauch begrenzt. "
-                           f"Abregelung: {pv_curtailed.sum() * 0.25 / 1000:.1f} MWh/Jahr")
+                           f"Abregelung: {pv_curtailed.sum() * dt_b / 1000:.1f} MWh/Jahr")
                     
                 elif feed_in_mode == "Begrenzte Einspeisung" and max_feed_in is not None:
                     # PV wird so begrenzt, dass Einspeisung max_feed_in nicht übersteigt
@@ -2394,8 +2492,10 @@ def show_mode_b_step1():
                     net_load = load.values - pv_used
                     pv_surplus = np.maximum(pv_used - load.values, 0)
                     
+                    # Zeitauflösung verwenden
+                    dt_b = st.session_state.get('time_resolution_b', {'dt': 0.25})['dt']
                     st.info(f"🔌 **Einspeisebegrenzung aktiv:** Max. {max_feed_in*1000:.0f} kW Einspeisung. "
-                           f"Abregelung: {pv_curtailed.sum() * 0.25 / 1000:.1f} MWh/Jahr")
+                           f"Abregelung: {pv_curtailed.sum() * dt_b / 1000:.1f} MWh/Jahr")
                 else:
                     # Unbegrenzt - Original-Logik
                     net_load = load.values - pv.values
@@ -2406,7 +2506,8 @@ def show_mode_b_step1():
                 
                 st.session_state.net_load_b = pd.Series(net_load, index=load.index)
                 st.session_state.pv_surplus_b = pd.Series(pv_surplus, index=load.index)
-                st.session_state.pv_curtailed_b = pv_curtailed.sum() * 0.25  # MWh
+                dt_b = st.session_state.get('time_resolution_b', {'dt': 0.25})['dt']
+                st.session_state.pv_curtailed_b = pv_curtailed.sum() * dt_b  # MWh
                 
                 st.markdown("---")
                 st.markdown("#### 📊 Zusammenfassung")
@@ -2418,20 +2519,23 @@ def show_mode_b_step1():
                 with col2:
                     st.metric("Max. Netzbezug", f"{max(net_load.max(), 0)*1000:.0f} kW")
                 with col3:
+                    time_res_b = st.session_state.get('time_resolution_b', {'dt': 0.25})
+                    dt_b = time_res_b['dt']
                     if feed_in_mode == "Unbegrenzt":
                         max_einspeisung = abs(min(net_load.min(), 0))
                         st.metric("Max. Einspeisung", f"{max_einspeisung*1000:.0f} kW")
                     else:
-                        st.metric("PV-Abregelung", f"{pv_curtailed.sum() * 0.25:.0f} kWh")
+                        st.metric("PV-Abregelung", f"{pv_curtailed.sum() * dt_b:.0f} kWh")
                 with col4:
-                    total_pv_used = (pv.values - pv_curtailed).sum() * 0.25 if feed_in_mode != "Unbegrenzt" else pv.sum() * 0.25
-                    self_cons_rate = pv_self_consumption.sum() / total_pv_used * 100 / 4 if total_pv_used > 0 else 0
+                    total_pv_used = (pv.values - pv_curtailed).sum() * dt_b if feed_in_mode != "Unbegrenzt" else pv.sum() * dt_b
+                    self_cons_rate = pv_self_consumption.sum() / total_pv_used * 100 / (1/dt_b) if total_pv_used > 0 else 0
                     st.metric("PV-Eigenverbrauch", f"{min(self_cons_rate, 100):.0f}%")
                 
                 # Visualisierung
                 with st.expander("Last und PV-Erzeugung (Beispielwoche)"):
                     days = 7
-                    end_idx = min(days * 96, len(load))
+                    steps_per_day_b = time_res_b.get('steps_per_day', 96)
+                    end_idx = min(days * steps_per_day_b, len(load))
                     
                     fig, ax = plt.subplots(figsize=(12, 5))
                     x = range(end_idx)
@@ -2447,7 +2551,7 @@ def show_mode_b_step1():
                     ax.plot(x, net_load[:end_idx] * 1000, color='#2ecc71', linewidth=1, label='Nettolast')
                     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
                     
-                    ax.set_xlabel('Zeitschritt (15 min)')
+                    ax.set_xlabel(f'Zeitschritt ({time_res_b.get("resolution", "15-Minuten")})')
                     ax.set_ylabel('Leistung (kW)')
                     ax.set_title('Last und PV-Erzeugung')
                     ax.legend()
@@ -2547,7 +2651,8 @@ def show_mode_b_step2():
     
     # Dauerlinie
     sorted_load = np.sort(load.values)[::-1]
-    hours = np.arange(len(sorted_load)) * 0.25  # 15-min zu Stunden
+    time_res_b = st.session_state.get('time_resolution_b', {'dt': 0.25})
+    hours = np.arange(len(sorted_load)) * time_res_b['dt']
     ax2.fill_between(hours, sorted_load * 1000, alpha=0.5, color='#3498db')
     ax2.plot(hours, sorted_load * 1000, color='#2980b9', label='Nettolast' if has_pv else 'Last')
     if has_pv and pv_profile is not None:
@@ -3236,7 +3341,8 @@ def show_mode_b_step5():
 def simulate_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_pv_inst_mw,
                          storage_power_mw, storage_capacity_mwh, eta_charge=0.95, 
                          eta_discharge=0.95, soc_min=0.0, soc_max=1.0,
-                         da_prices=None, price_threshold=None, discharge_strategy="immediate"):
+                         da_prices=None, price_threshold=None, discharge_strategy="immediate",
+                         time_resolution=None):
     """
     Simuliert den Speicherbetrieb bei NVP-Überbauung mit PyPSA.
     
@@ -3250,12 +3356,17 @@ def simulate_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_p
         da_prices: Day-Ahead-Preise (€/MWh), optional
         price_threshold: Nicht verwendet (PyPSA optimiert automatisch)
         discharge_strategy: Nicht verwendet (PyPSA optimiert automatisch)
+        time_resolution: dict mit 'dt' und 'steps_per_day' (optional, wird automatisch erkannt)
     
     Returns:
         dict mit Zeitreihen und Kennzahlen
     """
     n = len(wind_profile) if wind_profile is not None else len(pv_profile)
-    dt = 0.25  # 15 Minuten
+    
+    # Zeitauflösung erkennen falls nicht übergeben
+    if time_resolution is None:
+        time_resolution = detect_time_resolution(n)
+    dt = time_resolution['dt']
     
     # Erzeugung berechnen
     p_wind = wind_profile.values * p_wind_inst_mw if wind_profile is not None else np.zeros(n)
@@ -3508,7 +3619,7 @@ def optimize_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_p
                          eta_charge=0.95, eta_discharge=0.95, soc_min=0.0, soc_max=1.0,
                          da_prices=None, capex_power=80, capex_energy=250,
                          interest_rate=0.05, lifetime_years=15,
-                         opex_rate=0.02, feed_in_value=80):
+                         opex_rate=0.02, feed_in_value=80, time_resolution=None):
     """
     Optimiert Speicherleistung UND -kapazität für NVP-Überbauung.
     
@@ -3539,12 +3650,17 @@ def optimize_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_p
         lifetime_years: Lebensdauer für Annuität (Jahre)
         opex_rate: Betriebskosten als Anteil von CAPEX (z.B. 0.02 = 2%)
         feed_in_value: Marktwert der Einspeisung / Wert vermiedener Abregelung (€/MWh)
+        time_resolution: dict mit 'dt' und 'steps_per_day' (optional)
     
     Returns:
         dict mit optimaler Konfiguration und Ergebnissen
     """
     n = len(wind_profile) if wind_profile is not None else len(pv_profile)
-    dt = 0.25  # 15 Minuten
+    
+    # Zeitauflösung erkennen falls nicht übergeben
+    if time_resolution is None:
+        time_resolution = detect_time_resolution(n)
+    dt = time_resolution['dt']
     
     # Erzeugung berechnen
     p_wind = wind_profile.values * p_wind_inst_mw if wind_profile is not None else np.zeros(n)
@@ -4035,7 +4151,12 @@ def show_mode_c_step2():
                             values = values / values.max()
                     
                     st.session_state.wind_profile_c = pd.Series(values, index=df.index)
-                    st.success(f"✓ {len(df)} Datenpunkte geladen")
+                    
+                    # Zeitauflösung erkennen und speichern
+                    time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                    st.session_state.time_resolution_c = time_res
+                    
+                    st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
                     
                     with st.expander("Vorschau"):
                         st.line_chart(st.session_state.wind_profile_c.iloc[:min(1000, len(df))])
@@ -4069,7 +4190,15 @@ def show_mode_c_step2():
                             values = values / values.max()
                     
                     st.session_state.pv_profile_c = pd.Series(values, index=df.index)
-                    st.success(f"✓ {len(df)} Datenpunkte geladen")
+                    
+                    # Zeitauflösung erkennen und speichern (falls noch nicht durch Wind gesetzt)
+                    if 'time_resolution_c' not in st.session_state:
+                        time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                        st.session_state.time_resolution_c = time_res
+                    else:
+                        time_res = st.session_state.time_resolution_c
+                    
+                    st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
                     
                     with st.expander("Vorschau"):
                         st.line_chart(st.session_state.pv_profile_c.iloc[:min(1000, len(df))])
@@ -4228,13 +4357,23 @@ def show_mode_c_step3():
     p_surplus = np.maximum(p_ee - p_nvp, 0)
     p_grid_no_storage = np.minimum(p_ee, p_nvp)
     
-    dt = 0.25  # 15 Minuten
+    # Zeitauflösung erkennen
+    time_res = detect_time_resolution(n)
+    dt = time_res['dt']
+    steps_per_day = time_res['steps_per_day']
+    
+    # Info über erkannte Auflösung anzeigen
+    st.info(f"📊 Erkannte Zeitauflösung: **{time_res['resolution']}** ({n:,} Datenpunkte, {steps_per_day} pro Tag)")
+    
     total_generation = p_ee.sum() * dt
     total_surplus = p_surplus.sum() * dt
     total_grid = p_grid_no_storage.sum() * dt
     
     surplus_share = total_surplus / total_generation * 100 if total_generation > 0 else 0
     grid_utilization = total_grid / (p_nvp * n * dt) * 100 if p_nvp > 0 else 0
+    
+    # In Session State speichern für spätere Schritte
+    st.session_state.time_resolution_c = time_res
     
     st.markdown("---")
     
@@ -4269,24 +4408,25 @@ def show_mode_c_step3():
     with tab1:
         # Ausschnitt wählen
         days_to_show = st.slider("Anzeigetage", 1, 30, 7, key="days_c3")
-        end_idx = min(days_to_show * 96, n)
+        end_idx = min(days_to_show * steps_per_day, n)
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         
         x = range(end_idx)
         
+        # Gestapelte Darstellung: Wind + PV = Gesamterzeugung
         ax1.fill_between(x, p_wind_ts[:end_idx], alpha=0.5, label='Wind', color='#3498db')
         ax1.fill_between(x, p_wind_ts[:end_idx], p_ee[:end_idx], alpha=0.5, label='PV', color='#f1c40f')
-        ax1.axhline(y=p_nvp, color='red', linestyle='--', label=f'NVP ({p_nvp:.1f} MW)')
+        ax1.axhline(y=p_nvp, color='red', linestyle='--', linewidth=2, label=f'NVP ({p_nvp:.1f} MW)')
         ax1.set_ylabel('Leistung (MW)')
-        ax1.set_title('Erzeugung und NVP-Kapazität')
+        ax1.set_title('Gesamterzeugung (Wind + PV gestapelt) und NVP-Kapazität')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
         ax2.fill_between(x, p_grid_no_storage[:end_idx], alpha=0.5, label='Netzeinspeisung', color='#2ecc71')
         ax2.fill_between(x, p_grid_no_storage[:end_idx], p_ee[:end_idx], alpha=0.5, label='Überschuss', color='#e74c3c')
         ax2.set_ylabel('Leistung (MW)')
-        ax2.set_xlabel('Zeitschritt (15 min)')
+        ax2.set_xlabel(f'Zeitschritt ({time_res["resolution"]})')
         ax2.set_title('Netzeinspeisung und Überschuss')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
@@ -4881,7 +5021,10 @@ def show_mode_c_step5():
         st.markdown("#### 📊 Zeitreihen-Visualisierung")
         
         n_total = len(opt_result['p_ee'])
-        n_days_total = n_total // 96  # Gesamte Tage
+        # Zeitauflösung
+        time_res = st.session_state.get('time_resolution_c', detect_time_resolution(n_total))
+        steps_per_day = time_res['steps_per_day']
+        n_days_total = n_total // steps_per_day  # Gesamte Tage
         
         # Anzeigemodus wählen
         col1, col2 = st.columns(2)
@@ -4900,11 +5043,13 @@ def show_mode_c_step5():
                 if st.button("🔍 Interessanteste Woche finden", help="Findet die Woche mit höchster Speicheraktivität"):
                     # Finde Woche mit meister Speicheraktivität
                     p_charge = opt_result['p_charge']
+                    time_res = st.session_state.get('time_resolution_c', detect_time_resolution(n_total))
+                    steps_per_day = time_res['steps_per_day']
                     weekly_activity = []
-                    for week_start in range(0, n_total - 7*96, 96):  # Pro Tag
-                        week_end = min(week_start + 7*96, n_total)
+                    for week_start in range(0, n_total - 7*steps_per_day, steps_per_day):  # Pro Tag
+                        week_end = min(week_start + 7*steps_per_day, n_total)
                         activity = np.sum(p_charge[week_start:week_end])
-                        weekly_activity.append((week_start // 96, activity))
+                        weekly_activity.append((week_start // steps_per_day, activity))
                     
                     if weekly_activity:
                         best_day = max(weekly_activity, key=lambda x: x[1])[0]
@@ -4915,13 +5060,19 @@ def show_mode_c_step5():
             # Ganzes Jahr anzeigen - aggregiert auf Tageswerte für bessere Übersicht
             st.info("📅 Darstellung: Tägliche Mittelwerte über das gesamte Jahr")
             
+            # Zeitauflösung aus Session State oder erkennen
+            time_res = st.session_state.get('time_resolution_c', detect_time_resolution(n_total))
+            steps_per_day = time_res['steps_per_day']
+            dt = time_res['dt']
+            
             # Auf Tageswerte aggregieren
-            n_days = n_total // 96
-            daily_ee = np.array([opt_result['p_ee'][i*96:(i+1)*96].mean() for i in range(n_days)])
-            daily_grid = np.array([opt_result['p_grid'][i*96:(i+1)*96].mean() for i in range(n_days)])
-            daily_charge = np.array([opt_result['p_charge'][i*96:(i+1)*96].sum() * 0.25 for i in range(n_days)])  # MWh/Tag
-            daily_discharge = np.array([opt_result['p_discharge'][i*96:(i+1)*96].sum() * 0.25 for i in range(n_days)])
-            daily_soc_max = np.array([opt_result['soc'][i*96:(i+1)*96].max() for i in range(n_days)])
+            n_days = n_total // steps_per_day
+            daily_ee = np.array([opt_result['p_ee'][i*steps_per_day:(i+1)*steps_per_day].mean() for i in range(n_days)])
+            daily_grid = np.array([opt_result['p_grid'][i*steps_per_day:(i+1)*steps_per_day].mean() for i in range(n_days)])
+            daily_charge = np.array([opt_result['p_charge'][i*steps_per_day:(i+1)*steps_per_day].sum() * dt for i in range(n_days)])  # MWh/Tag
+            daily_discharge = np.array([opt_result['p_discharge'][i*steps_per_day:(i+1)*steps_per_day].sum() * dt for i in range(n_days)])
+            daily_soc_max = np.array([opt_result['soc'][i*steps_per_day:(i+1)*steps_per_day].max() for i in range(n_days)])
+            daily_soc_min = np.array([opt_result['soc'][i*steps_per_day:(i+1)*steps_per_day].min() for i in range(n_days)])
             
             fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
             ax1, ax2, ax3 = axes
@@ -4947,12 +5098,26 @@ def show_mode_c_step5():
             ax2.legend(loc='upper right')
             ax2.grid(True, alpha=0.3)
             
-            # SOC Maximum pro Tag
-            ax3.fill_between(x, daily_soc_max, alpha=0.5, color='#9b59b6')
-            ax3.plot(x, daily_soc_max, color='#9b59b6', linewidth=1)
-            ax3.set_ylabel('Max. SOC (MWh)')
+            # SOC Maximum und Minimum pro Tag mit Grenzen
+            # In Modus C wird die volle Kapazität genutzt (soc_min=0, soc_max=1)
+            # Die nutzbare Kapazität entspricht daher der Gesamtkapazität
+            total_capacity = optimal['storage_capacity_mwh']
+            usable_capacity = total_capacity  # Da soc_min=0, soc_max=1 in Modus C
+            
+            ax3.fill_between(x, daily_soc_min, daily_soc_max, alpha=0.3, color='#9b59b6', label='SOC-Bereich (Min-Max)')
+            ax3.plot(x, daily_soc_max, color='#9b59b6', linewidth=1, label='Max. Ladezustand')
+            ax3.plot(x, daily_soc_min, color='#9b59b6', linewidth=1, linestyle='--', alpha=0.7, label='Min. Ladezustand')
+            
+            # Referenzlinie für Gesamtkapazität
+            ax3.axhline(y=total_capacity, color='#e74c3c', linestyle=':', linewidth=2, 
+                       label=f'Speicherkapazität ({total_capacity:.1f} MWh)')
+            ax3.axhline(y=0, color='#333', linestyle='-', linewidth=0.5)
+            
+            ax3.set_ylabel('Ladezustand (MWh)')
             ax3.set_xlabel('Tag des Jahres')
-            ax3.set_title('Maximaler Speicherfüllstand pro Tag')
+            ax3.set_title('Speicherfüllstand pro Tag')
+            ax3.set_ylim(-0.05 * total_capacity, total_capacity * 1.1)
+            ax3.legend(loc='upper right')
             ax3.grid(True, alpha=0.3)
             
             # X-Achse: Monate markieren
@@ -4966,6 +5131,11 @@ def show_mode_c_step5():
             
         else:
             # Detailansicht: Wochenweise
+            # Zeitauflösung aus Session State oder erkennen
+            time_res = st.session_state.get('time_resolution_c', detect_time_resolution(n_total))
+            steps_per_day = time_res['steps_per_day']
+            dt = time_res['dt']
+            
             col1, col2 = st.columns([3, 1])
             
             with col1:
@@ -4986,8 +5156,8 @@ def show_mode_c_step5():
                     key="days_c5_opt"
                 )
             
-            start_idx = (start_day - 1) * 96
-            end_idx = min(start_idx + days_to_show * 96, n_total)
+            start_idx = (start_day - 1) * steps_per_day
+            end_idx = min(start_idx + days_to_show * steps_per_day, n_total)
             
             # Monat berechnen für Titel
             month_names = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 
@@ -5163,8 +5333,13 @@ def show_mode_c_step5():
     # Beispielwoche visualisieren
     st.markdown("#### 📊 Beispielwoche mit Speicherbetrieb")
     
+    # Zeitauflösung
+    time_res_c = st.session_state.get('time_resolution_c', detect_time_resolution(len(sim['p_ee'])))
+    steps_per_day_c = time_res_c['steps_per_day']
+    dt_c = time_res_c['dt']
+    
     days_to_show = st.slider("Anzeigetage", 1, 14, 7, key="days_c5")
-    end_idx = min(days_to_show * 96, len(sim['p_ee']))
+    end_idx = min(days_to_show * steps_per_day_c, len(sim['p_ee']))
     
     fig, axes = plt.subplots(4 if da_prices is not None else 3, 1, figsize=(14, 12 if da_prices is not None else 10), sharex=True)
     
