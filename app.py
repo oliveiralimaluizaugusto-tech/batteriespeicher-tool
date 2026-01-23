@@ -33,6 +33,25 @@ from matplotlib.ticker import MaxNLocator
 # PyPSA für Optimierung
 import pypsa
 
+# Export und Analyse-Modul
+try:
+    from export_analytics import (
+        ExportConfig,
+        export_parameter_study,
+        export_timeseries,
+        export_surplus_histogram,
+        export_seasonal_summary,
+        run_full_export,
+        create_export_directory,
+        generate_metadata,
+        calculate_surplus_histogram,
+        calculate_seasonal_statistics,
+        detect_time_resolution_from_index
+    )
+    EXPORT_MODULE_AVAILABLE = True
+except ImportError:
+    EXPORT_MODULE_AVAILABLE = False
+
 # =============================================================================
 # Hilfsfunktionen
 # =============================================================================
@@ -4866,6 +4885,265 @@ def show_mode_c_step4():
                 st.rerun()
 
 
+def show_extended_export_ui(
+    study_results: pd.DataFrame,
+    simulation_result: dict,
+    optimal_config: pd.Series,
+    da_prices: pd.Series = None
+):
+    """
+    Zeigt die erweiterte Export-UI für Parameterstudien und Zeitreihen.
+    
+    Args:
+        study_results: DataFrame mit Parameterstudie-Ergebnissen
+        simulation_result: Dictionary mit Simulationsergebnissen
+        optimal_config: Series mit optimaler Konfiguration
+        da_prices: Optional - Day-Ahead-Preise
+    """
+    st.markdown("#### 📊 Erweiterte Datenexporte")
+    
+    st.markdown("""
+    <div class="info-box">
+        <strong>Erweiterte Export-Optionen:</strong> Exportieren Sie detaillierte Rohdaten, 
+        Zeitreihen, Überschuss-Histogramme und saisonale Auswertungen für externe Analyse.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Export-Optionen
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        export_param_study = st.checkbox(
+            "📋 Parameterstudie (Rohdaten-CSV)", 
+            value=True,
+            help="Alle Parameterkombinationen mit vollständigen Kennzahlen",
+            key="ext_export_param"
+        )
+        export_histograms = st.checkbox(
+            "📊 Überschuss-Histogramm",
+            value=True,
+            help="Verteilung der Überschussleistung nach Leistungsklassen",
+            key="ext_export_hist"
+        )
+    
+    with col2:
+        export_timeseries = st.checkbox(
+            "📈 Zeitreihen (15-min/stündlich)",
+            value=False,
+            help="Vollständige Zeitreihen für externe Analyse",
+            key="ext_export_ts"
+        )
+        export_seasonal = st.checkbox(
+            "🌡️ Saisonale Auswertung",
+            value=True,
+            help="Winter/Sommer-Vergleich der Überschüsse",
+            key="ext_export_season"
+        )
+    
+    # Erweiterte Optionen
+    with st.expander("⚙️ Erweiterte Export-Optionen"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            histogram_bin_width = st.number_input(
+                "Histogramm-Binbreite (MW)",
+                min_value=0.0,
+                max_value=50.0,
+                value=0.0,
+                step=1.0,
+                help="0 = automatisch (adaptiv: max/20)",
+                key="ext_hist_bin"
+            )
+        
+        with col2:
+            season_def = st.selectbox(
+                "Saisondefinition",
+                ["germany", "meteorological"],
+                index=0,
+                format_func=lambda x: "Deutschland (Nov-Feb/Mai-Aug)" if x == "germany" else "Meteorologisch",
+                key="ext_season_def"
+            )
+        
+        with col3:
+            output_format = st.selectbox(
+                "Dezimaltrennzeichen",
+                ["punkt", "komma"],
+                index=0,
+                format_func=lambda x: "Punkt (international)" if x == "punkt" else "Komma (deutsch)",
+                key="ext_decimal"
+            )
+    
+    # Export-Button
+    if st.button("📥 Erweiterten Export starten", type="secondary", use_container_width=True, key="ext_export_btn"):
+        
+        with st.spinner("Exportiere Daten..."):
+            try:
+                # Export-Verzeichnis erstellen
+                export_dir = create_export_directory("exports")
+                metadata = generate_metadata()
+                
+                exported_files = []
+                
+                # Szenario-Parameter zusammenstellen
+                scenario_params = {
+                    "scenario_name": "nvp_overbuild",
+                    "nvp_mw": st.session_state.get('p_nvp_mw', 0),
+                    "wind_mw": st.session_state.get('p_wind_inst_mw', 0),
+                    "pv_mw": st.session_state.get('p_pv_inst_mw', 0),
+                    "storage_capacity_mwh": optimal_config.get('storage_capacity_mwh', 0),
+                    "storage_power_mw": optimal_config.get('storage_power_mw', 0),
+                }
+                
+                # Zeitauflösung bestimmen
+                time_res = st.session_state.get('time_resolution_c', {'dt': 0.25, 'resolution': '15-Minuten'})
+                dt_hours = time_res['dt']
+                
+                # 1. Parameterstudie exportieren
+                if export_param_study and study_results is not None and len(study_results) > 0:
+                    param_path = export_parameter_study(
+                        study_results, 
+                        scenario_params, 
+                        "exports",
+                        "parameter_study_results.csv"
+                    )
+                    exported_files.append(("Parameterstudie", param_path))
+                
+                # 2. Zeitreihen exportieren
+                if export_timeseries and simulation_result is not None:
+                    # Zeitreihen-Dictionary erstellen
+                    timeseries_data = {
+                        'p_ee': simulation_result.get('p_ee', np.array([])),
+                        'p_grid': simulation_result.get('p_grid', np.array([])),
+                        'p_charge': simulation_result.get('p_charge', np.array([])),
+                        'p_discharge': simulation_result.get('p_discharge', np.array([])),
+                        'soc': simulation_result.get('soc', np.array([])),
+                        'p_curtail': simulation_result.get('p_curtailment', np.array([])),
+                        'p_surplus': simulation_result.get('p_surplus', np.array([])),
+                    }
+                    
+                    # Wind/PV separat falls vorhanden
+                    wind_profile = st.session_state.get('wind_profile_c')
+                    pv_profile = st.session_state.get('pv_profile_c')
+                    
+                    if wind_profile is not None:
+                        timeseries_data['p_wind'] = wind_profile.values * st.session_state.get('p_wind_inst_mw', 0)
+                    if pv_profile is not None:
+                        timeseries_data['p_pv'] = pv_profile.values * st.session_state.get('p_pv_inst_mw', 0)
+                    
+                    # Timestamps erstellen
+                    n = len(timeseries_data['p_ee'])
+                    if n > 0:
+                        freq = "15min" if dt_hours == 0.25 else "h"
+                        timestamps = pd.date_range(start="2024-01-01", periods=n, freq=freq)
+                        
+                        ts_path = export_timeseries(
+                            run_id=1,
+                            timeseries_data=timeseries_data,
+                            scenario_params=scenario_params,
+                            timestamps=timestamps,
+                            output_dir="exports"
+                        )
+                        exported_files.append(("Zeitreihen", ts_path))
+                
+                # 3. Überschuss-Histogramm exportieren
+                if export_histograms and simulation_result is not None:
+                    surplus = simulation_result.get('p_surplus', simulation_result.get('p_curtailment', np.array([])))
+                    if len(surplus) > 0:
+                        bin_width = histogram_bin_width if histogram_bin_width > 0 else None
+                        csv_path, png_path = export_surplus_histogram(
+                            run_id=1,
+                            surplus_mw=surplus,
+                            dt_hours=dt_hours,
+                            bin_width_mw=bin_width,
+                            output_dir="exports",
+                            create_plot=True
+                        )
+                        exported_files.append(("Histogramm CSV", csv_path))
+                        if png_path:
+                            exported_files.append(("Histogramm PNG", png_path))
+                
+                # 4. Saisonale Auswertung exportieren
+                if export_seasonal and simulation_result is not None:
+                    surplus = simulation_result.get('p_surplus', simulation_result.get('p_curtailment', np.array([])))
+                    curtail = simulation_result.get('p_curtailment', np.zeros_like(surplus))
+                    
+                    if len(surplus) > 0:
+                        n = len(surplus)
+                        freq = "15min" if dt_hours == 0.25 else "h"
+                        timestamps = pd.date_range(start="2024-01-01", periods=n, freq=freq)
+                        
+                        # Captured = Ladeleistung
+                        captured = simulation_result.get('p_charge', None)
+                        
+                        season_path = export_seasonal_summary(
+                            run_id=1,
+                            timestamps=timestamps,
+                            surplus_mw=surplus,
+                            curtailment_mw=curtail,
+                            dt_hours=dt_hours,
+                            captured_mw=captured,
+                            season_definition=season_def,
+                            output_dir="exports"
+                        )
+                        exported_files.append(("Saisonale Auswertung", season_path))
+                
+                # Erfolg anzeigen
+                if exported_files:
+                    st.success(f"✅ {len(exported_files)} Dateien exportiert!")
+                    
+                    # Dateien auflisten
+                    for name, path in exported_files:
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.text(f"📄 {name}: {path.name}")
+                        with col2:
+                            # Download-Button für jede Datei
+                            with open(path, 'rb') as f:
+                                st.download_button(
+                                    "⬇️",
+                                    f.read(),
+                                    path.name,
+                                    key=f"dl_{path.name}"
+                                )
+                    
+                    # Saisonale Zusammenfassung inline anzeigen
+                    if export_seasonal and simulation_result is not None:
+                        st.markdown("##### 🌡️ Saisonale Zusammenfassung")
+                        surplus = simulation_result.get('p_surplus', simulation_result.get('p_curtailment', np.array([])))
+                        curtail = simulation_result.get('p_curtailment', np.zeros_like(surplus))
+                        
+                        if len(surplus) > 0:
+                            n = len(surplus)
+                            freq = "15min" if dt_hours == 0.25 else "h"
+                            timestamps = pd.date_range(start="2024-01-01", periods=n, freq=freq)
+                            captured = simulation_result.get('p_charge', None)
+                            
+                            seasonal_df = calculate_seasonal_statistics(
+                                timestamps, surplus, curtail, dt_hours, captured, season_def
+                            )
+                            
+                            # Tabelle formatieren
+                            display_df = seasonal_df.copy()
+                            display_df['surplus_energy_MWh'] = display_df['surplus_energy_MWh'].apply(lambda x: f"{x:,.0f}")
+                            display_df['curtailment_energy_MWh'] = display_df['curtailment_energy_MWh'].apply(lambda x: f"{x:,.0f}")
+                            display_df['hours_surplus'] = display_df['hours_surplus'].apply(lambda x: f"{x:,.0f}")
+                            display_df['max_surplus_MW'] = display_df['max_surplus_MW'].apply(lambda x: f"{x:.1f}")
+                            display_df['p95_surplus_MW'] = display_df['p95_surplus_MW'].apply(lambda x: f"{x:.1f}")
+                            if 'capture_rate_season' in display_df.columns:
+                                display_df['capture_rate_season'] = display_df['capture_rate_season'].apply(
+                                    lambda x: f"{x*100:.1f}%" if pd.notna(x) else "-"
+                                )
+                            
+                            st.dataframe(display_df, use_container_width=True)
+                else:
+                    st.warning("Keine Daten zum Exportieren vorhanden.")
+                    
+            except Exception as e:
+                st.error(f"Fehler beim Export: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
+
+
 def show_mode_c_step5():
     """Modus C - Schritt 5: Ergebnisse und Wirtschaftlichkeit."""
     
@@ -5101,7 +5379,7 @@ def show_mode_c_step5():
             # SOC Maximum und Minimum pro Tag mit Grenzen
             # In Modus C wird die volle Kapazität genutzt (soc_min=0, soc_max=1)
             # Die nutzbare Kapazität entspricht daher der Gesamtkapazität
-            total_capacity = optimal['storage_capacity_mwh']
+            total_capacity = opt_result['optimal_capacity_mwh']
             usable_capacity = total_capacity  # Da soc_min=0, soc_max=1 in Modus C
             
             ax3.fill_between(x, daily_soc_min, daily_soc_max, alpha=0.3, color='#9b59b6', label='SOC-Bereich (Min-Max)')
@@ -5198,6 +5476,33 @@ def show_mode_c_step5():
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
+        
+        # Erweiterter Export für automatische Optimierung
+        if EXPORT_MODULE_AVAILABLE:
+            st.markdown("---")
+            st.markdown("#### 📥 Erweiterte Datenexporte")
+            
+            # Für Fall 1 erstellen wir eine "Ein-Zeilen-Parameterstudie"
+            single_result = pd.DataFrame([{
+                'storage_power_mw': opt_result['optimal_power_mw'],
+                'storage_capacity_mwh': opt_result['optimal_capacity_mwh'],
+                'duration_h': opt_result['ep_ratio'],
+                'capture_rate': opt_result['capture_rate'],
+                'grid_utilization': opt_result['grid_utilization'],
+                'cycles': opt_result['cycles'],
+                'curtailment_mwh': opt_result['total_curtailment_mwh'],
+                'surplus_mwh': opt_result['total_surplus_mwh'],
+            }])
+            
+            # Optimale Konfiguration als Series
+            optimal_series = single_result.iloc[0]
+            
+            show_extended_export_ui(
+                study_results=single_result,
+                simulation_result=opt_result,
+                optimal_config=optimal_series,
+                da_prices=st.session_state.get('da_prices_c')
+            )
         
         # Optional: Parameterstudie nachträglich durchführen
         st.markdown("---")
@@ -5464,6 +5769,11 @@ def show_mode_c_step5():
             "text/csv",
             use_container_width=True
         )
+    
+    # Erweiterter Export (falls Modul verfügbar)
+    if EXPORT_MODULE_AVAILABLE:
+        st.markdown("---")
+        show_extended_export_ui(results, sim, optimal, da_prices)
     
     st.markdown("---")
     

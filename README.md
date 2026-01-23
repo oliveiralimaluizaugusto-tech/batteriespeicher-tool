@@ -18,7 +18,34 @@ Das Tool bietet drei Analysemodi für verschiedene Anwendungsfälle:
 
 ---
 
-## 📋 Changelog v3 (Januar 2026)
+## 📋 Changelog v3.1 (Januar 2026)
+
+### NEU: Erweiterte Export- und Analysefunktionen
+
+**1. CSV-Export der Parameterstudie (Rohdaten)**
+- Vollständige Rohdaten statt nur Heatmap
+- Spalten: run_id, scenario, nvp_mw, wind_mw, pv_mw, E_MWh, P_MW, EP_h, eta_roundtrip, soc_min, soc_max, curtailment_without_MWh, curtailment_with_MWh, capture_rate, cycles_estimate, etc.
+- Export nach `/exports/parameter_study_results.csv`
+
+**2. Zeitreihen-Export (15-min oder stündlich)**
+- Automatische Erkennung der Zeitauflösung
+- Spalten: timestamp, wind_MW, pv_MW, generation_total_MW, nvp_export_MW, curtailment_MW, battery_charge_MW, battery_discharge_MW, soc_MWh, soc_pu
+- Export nach `/exports/timeseries_run_<id>.csv`
+
+**3. Überschuss-Histogramm mit Leistungsklassen**
+- Zeigt "Anzahl Stunden pro Leistungsintervall"
+- Adaptive Binbreite (max_surplus/20, min 1 MW) oder benutzerdefiniert
+- Export als CSV und PNG
+
+**4. Saisonale Auswertung (Winter/Sommer)**
+- Definition für Deutschland: Winter (Nov-Feb), Sommer (Mai-Aug), Übergang (Mär-Apr, Sep-Okt)
+- Kennzahlen: surplus_energy_MWh, curtailment_energy_MWh, hours_surplus, max_surplus_MW, p95_surplus_MW, capture_rate_season
+
+### Automatische Zeitauflösungserkennung
+
+Das Tool erkennt nun automatisch die Zeitauflösung der hochgeladenen Profile:
+- **35.040 Datenpunkte** → 15-Minuten-Auflösung
+- **8.760 Datenpunkte** → Stündliche Auflösung
 
 ### Modus A - Verbesserte Wirtschaftlichkeitsrechnung
 
@@ -79,12 +106,12 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 ### Modus B - Peak Shaving
 - **Lastprofil** (CSV/Excel): Zeitreihe mit Leistungswerten in kW oder MW
 - Format: Spalte 1 = Zeitstempel, Spalte 2 = Leistung
-- Auflösung: 15-Minuten empfohlen
+- Auflösung: 15-Minuten oder stündlich (wird automatisch erkannt)
 
 ### Modus C - NVP-Überbauung
 - **Wind-/PV-Profile** (CSV): Normierte Erzeugungsprofile (0-1)
 - Format: Spalte 1 = Zeitstempel, Spalte 2 = normierte Leistung
-- Auflösung: 15-Minuten, 1 Jahr (35.040 Zeitschritte)
+- Auflösung: 15-Minuten (35.040) oder stündlich (8.760) - wird automatisch erkannt
 
 ---
 
@@ -107,9 +134,16 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 
 ```
 batteriespeicher-tool/
-├── app.py              # Hauptanwendung (Streamlit)
-├── requirements.txt    # Python-Abhängigkeiten
-└── README.md           # Diese Datei
+├── app.py                # Hauptanwendung (Streamlit)
+├── export_analytics.py   # Export- und Analysemodul
+├── requirements.txt      # Python-Abhängigkeiten
+├── exports/              # Exportierte Dateien (automatisch erstellt)
+│   ├── parameter_study_results.csv
+│   ├── timeseries_run_001.csv
+│   ├── surplus_histogram_run_001.csv
+│   ├── surplus_histogram_run_001.png
+│   └── seasonal_summary_run_001.csv
+└── README.md             # Diese Datei
 ```
 
 ---
