@@ -3962,6 +3962,7 @@ def optimize_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_p
     }
 
 
+
 def show_mode_c():
     """Zeigt den Ablauf für Modus C: NVP-Überbauung."""
     
@@ -4515,7 +4516,10 @@ def show_mode_c_step4():
     st.markdown("#### 🎯 Berechnungsmodus")
     calc_mode = st.radio(
         "Wie soll die optimale Speichergröße ermittelt werden?",
-        ["Automatische Optimierung (empfohlen)", "Manuelle Parameterstudie"],
+        [
+            "Automatische Optimierung (empfohlen)", 
+            "Manuelle Parameterstudie"
+        ],
         horizontal=True,
         help="Die automatische Optimierung findet die optimale Speichergröße in einem Rechenlauf. "
              "Die Parameterstudie testet alle Kombinationen und zeigt eine Heatmap."
@@ -4524,14 +4528,14 @@ def show_mode_c_step4():
     st.markdown("---")
     
     if calc_mode == "Automatische Optimierung (empfohlen)":
-        # === NEUE AUTOMATISCHE OPTIMIERUNG ===
+        # === AUTOMATISCHE OPTIMIERUNG MIT PYPSA ===
         st.markdown("""
         <div class="info-box">
             <strong>Automatische Optimierung mit PyPSA</strong><br>
             Das Tool findet in einem Rechenlauf die optimale Speichergröße, die:
             <ul>
                 <li>Abregelung minimiert / Netzeinspeisung maximiert</li>
-                <li>Speicherkosten berücksichtigt</li>
+                <li>Speicherkosten (CAPEX + OPEX) berücksichtigt</li>
                 <li>Die NVP-Grenze einhält</li>
             </ul>
         </div>
@@ -4707,7 +4711,7 @@ def show_mode_c_step4():
                 st.session_state.current_step = 5
                 st.rerun()
     
-    else:
+    else:  # Manuelle Parameterstudie
         # === MANUELLE PARAMETERSTUDIE (wie bisher) ===
         st.markdown("""
         <div class="info-box">
@@ -5335,77 +5339,97 @@ def show_mode_c_step5():
                         st.rerun()
         
         if view_mode == "Ganzes Jahr (Übersicht)":
-            # Ganzes Jahr anzeigen - aggregiert auf Tageswerte für bessere Übersicht
-            st.info("📅 Darstellung: Tägliche Mittelwerte über das gesamte Jahr")
+            # Ganzes Jahr anzeigen - mit tatsächlichen Werten (nicht aggregiert)
+            st.info("📅 Darstellung: Tatsächliche Zeitreihen über das gesamte Jahr")
             
             # Zeitauflösung aus Session State oder erkennen
             time_res = st.session_state.get('time_resolution_c', detect_time_resolution(n_total))
             steps_per_day = time_res['steps_per_day']
             dt = time_res['dt']
+            resolution_label = time_res['resolution']
             
-            # Auf Tageswerte aggregieren
-            n_days = n_total // steps_per_day
-            daily_ee = np.array([opt_result['p_ee'][i*steps_per_day:(i+1)*steps_per_day].mean() for i in range(n_days)])
-            daily_grid = np.array([opt_result['p_grid'][i*steps_per_day:(i+1)*steps_per_day].mean() for i in range(n_days)])
-            daily_charge = np.array([opt_result['p_charge'][i*steps_per_day:(i+1)*steps_per_day].sum() * dt for i in range(n_days)])  # MWh/Tag
-            daily_discharge = np.array([opt_result['p_discharge'][i*steps_per_day:(i+1)*steps_per_day].sum() * dt for i in range(n_days)])
-            daily_soc_max = np.array([opt_result['soc'][i*steps_per_day:(i+1)*steps_per_day].max() for i in range(n_days)])
-            daily_soc_min = np.array([opt_result['soc'][i*steps_per_day:(i+1)*steps_per_day].min() for i in range(n_days)])
+            p_nvp = st.session_state.p_nvp_mw
             
-            fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-            ax1, ax2, ax3 = axes
+            # Zeitachse für das ganze Jahr (in Tagen)
+            x_days = np.arange(n_total) / steps_per_day
             
-            x = range(n_days)
+            # Überschuss berechnen (Leistung über NVP)
+            p_surplus = np.maximum(opt_result['p_ee'] - p_nvp, 0)
+            
+            fig, axes = plt.subplots(4, 1, figsize=(14, 14), sharex=True)
+            ax1, ax2, ax3, ax4 = axes
+            
             months = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez']
+            month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
             
-            # Erzeugung und Netzeinspeisung (Tagesmittel)
-            ax1.fill_between(x, daily_ee, alpha=0.3, label='Ø Erzeugung', color='#3498db')
-            ax1.plot(x, daily_grid, label='Ø Netzeinspeisung', color='#2ecc71', linewidth=1)
-            ax1.axhline(y=st.session_state.p_nvp_mw, color='red', linestyle='--', label='NVP-Kapazität', alpha=0.7)
+            # 1. Erzeugung und Netzeinspeisung (tatsächliche Werte)
+            ax1.fill_between(x_days, opt_result['p_ee'], alpha=0.4, label='Erzeugung', color='#3498db')
+            ax1.plot(x_days, opt_result['p_grid'], label='Netzeinspeisung', color='#2ecc71', linewidth=0.5, alpha=0.8)
+            ax1.axhline(y=p_nvp, color='red', linestyle='--', linewidth=2, label=f'NVP-Kapazität ({p_nvp:.0f} MW)')
             ax1.set_ylabel('Leistung (MW)')
-            ax1.set_title('Erzeugung und Netzeinspeisung (Tagesmittel)')
+            ax1.set_title('Erzeugung und Netzeinspeisung (tatsächliche Werte)')
             ax1.legend(loc='upper right')
             ax1.grid(True, alpha=0.3)
+            ax1.set_ylim(0, max(opt_result['p_ee'].max() * 1.1, p_nvp * 1.2))
             
-            # Speicherenergie pro Tag
-            ax2.bar(x, daily_charge, alpha=0.7, label='Geladen (MWh/Tag)', color='#e74c3c', width=1)
-            ax2.bar(x, -daily_discharge, alpha=0.7, label='Entladen (MWh/Tag)', color='#2ecc71', width=1)
-            ax2.axhline(y=0, color='black', linewidth=0.5)
-            ax2.set_ylabel('Energie (MWh/Tag)')
-            ax2.set_title('Tägliche Speichernutzung')
+            # 2. Überschuss und Abregelung (tatsächliche Leistung)
+            ax2.fill_between(x_days, p_surplus, alpha=0.5, label='Überschuss (über NVP)', color='#e74c3c')
+            ax2.fill_between(x_days, opt_result['p_curtail'], alpha=0.7, label='Abregelung (mit Speicher)', color='#c0392b')
+            ax2.set_ylabel('Leistung (MW)')
+            total_surplus_mwh = p_surplus.sum() * dt
+            total_curtail_mwh = opt_result['p_curtail'].sum() * dt
+            ax2.set_title(f'Überschuss und Abregelung (Gesamt: {total_surplus_mwh:,.0f} MWh Überschuss, {total_curtail_mwh:,.0f} MWh abgeregelt)')
             ax2.legend(loc='upper right')
             ax2.grid(True, alpha=0.3)
             
-            # SOC Maximum und Minimum pro Tag mit Grenzen
-            # In Modus C wird die volle Kapazität genutzt (soc_min=0, soc_max=1)
-            # Die nutzbare Kapazität entspricht daher der Gesamtkapazität
-            total_capacity = opt_result['optimal_capacity_mwh']
-            usable_capacity = total_capacity  # Da soc_min=0, soc_max=1 in Modus C
-            
-            ax3.fill_between(x, daily_soc_min, daily_soc_max, alpha=0.3, color='#9b59b6', label='SOC-Bereich (Min-Max)')
-            ax3.plot(x, daily_soc_max, color='#9b59b6', linewidth=1, label='Max. Ladezustand')
-            ax3.plot(x, daily_soc_min, color='#9b59b6', linewidth=1, linestyle='--', alpha=0.7, label='Min. Ladezustand')
-            
-            # Referenzlinie für Gesamtkapazität
-            ax3.axhline(y=total_capacity, color='#e74c3c', linestyle=':', linewidth=2, 
-                       label=f'Speicherkapazität ({total_capacity:.1f} MWh)')
-            ax3.axhline(y=0, color='#333', linestyle='-', linewidth=0.5)
-            
-            ax3.set_ylabel('Ladezustand (MWh)')
-            ax3.set_xlabel('Tag des Jahres')
-            ax3.set_title('Speicherfüllstand pro Tag')
-            ax3.set_ylim(-0.05 * total_capacity, total_capacity * 1.1)
+            # 3. Speicherleistung (Laden/Entladen)
+            ax3.fill_between(x_days, opt_result['p_charge'], alpha=0.7, label='Laden', color='#e74c3c')
+            ax3.fill_between(x_days, -opt_result['p_discharge'], alpha=0.7, label='Entladen', color='#2ecc71')
+            ax3.axhline(y=0, color='black', linewidth=0.5)
+            ax3.set_ylabel('Speicherleistung (MW)')
+            ax3.set_title('Speicherbetrieb (Laden/Entladen)')
             ax3.legend(loc='upper right')
             ax3.grid(True, alpha=0.3)
             
+            # 4. SOC (Ladezustand)
+            total_capacity = opt_result['optimal_capacity_mwh']
+            soc_data = opt_result['soc'][:n_total] if len(opt_result['soc']) > n_total else opt_result['soc']
+            
+            ax4.fill_between(x_days[:len(soc_data)], soc_data, alpha=0.5, color='#9b59b6', label='Ladezustand')
+            ax4.plot(x_days[:len(soc_data)], soc_data, color='#9b59b6', linewidth=0.3)
+            ax4.axhline(y=total_capacity, color='#e74c3c', linestyle=':', linewidth=2, 
+                       label=f'Speicherkapazität ({total_capacity:.1f} MWh)')
+            ax4.axhline(y=0, color='#333', linestyle='-', linewidth=0.5)
+            
+            ax4.set_ylabel('Ladezustand (MWh)')
+            ax4.set_xlabel('Tag des Jahres')
+            ax4.set_title('Speicherfüllstand')
+            ax4.set_ylim(-0.05 * total_capacity if total_capacity > 0 else -1, 
+                        total_capacity * 1.1 if total_capacity > 0 else 10)
+            ax4.legend(loc='upper right')
+            ax4.grid(True, alpha=0.3)
+            
             # X-Achse: Monate markieren
-            month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-            ax3.set_xticks(month_starts)
-            ax3.set_xticklabels(months)
+            ax4.set_xticks(month_starts)
+            ax4.set_xticklabels(months)
+            ax4.set_xlim(0, 365)
             
             plt.tight_layout()
             st.pyplot(fig)
             plt.close()
+            
+            # Zusammenfassung
+            st.markdown("##### 📊 Jahresstatistik")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                hours_surplus = (p_surplus > 0).sum() * dt
+                st.metric("Stunden mit Überschuss", f"{hours_surplus:,.0f} h")
+            with col2:
+                st.metric("Max. Überschuss", f"{p_surplus.max():.1f} MW")
+            with col3:
+                st.metric("Gesamt-Überschuss", f"{total_surplus_mwh:,.0f} MWh")
+            with col4:
+                st.metric("Max. Erzeugung", f"{opt_result['p_ee'].max():.1f} MW")
             
         else:
             # Detailansicht: Wochenweise
