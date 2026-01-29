@@ -29,6 +29,7 @@ import json
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
+from matplotlib.colors import BoundaryNorm
 
 # PyPSA für Optimierung
 import pypsa
@@ -72,6 +73,193 @@ def calculate_annuity_factor(rate, years):
     if rate == 0 or rate is None:
         return 1 / years if years > 0 else 1
     return (rate * (1 + rate) ** years) / ((1 + rate) ** years - 1)
+
+
+def calculate_capex_components(system_price_kwh, reference_duration_h=2.0, 
+                                reference_c_E=165, reference_c_P=170):
+    """
+    Berechnet Leistungs- und Energiekomponente aus einem Systempreis.
+    
+    Lineares Kostenmodell nach NREL ATB:
+        CAPEX = c_P · P + c_E · E
+        c_sys(h) = c_E + c_P / h
+    
+    Die Referenzwerte stammen aus NREL ATB 2024 (Utility-Scale LFP, 4h),
+    skaliert auf europäisches Kostenniveau.
+    
+    Args:
+        system_price_kwh: Systempreis in €/kWh
+        reference_duration_h: Referenzdauer für den Systempreis (Standard: 2h)
+        reference_c_E: Referenz-Energiekomponente in €/kWh (Standard: 165)
+        reference_c_P: Referenz-Leistungskomponente in €/kW (Standard: 170)
+    
+    Returns:
+        dict mit c_E (€/kWh), c_P (€/kW) und Metadaten
+    """
+    # Referenz-Systempreis bei der Referenzdauer
+    reference_system_price = reference_c_E + reference_c_P / reference_duration_h
+    
+    # Skalierungsfaktor
+    k = system_price_kwh / reference_system_price
+    
+    # Skalierte Komponenten
+    c_E = k * reference_c_E
+    c_P = k * reference_c_P
+    
+    return {
+        'c_E': c_E,  # €/kWh
+        'c_P': c_P,  # €/kW
+        'scaling_factor': k,
+        'reference_duration_h': reference_duration_h,
+        'reference_system_price': reference_system_price,
+        'input_system_price': system_price_kwh,
+    }
+
+
+def calculate_total_capex(power_kw, capacity_kwh, c_E, c_P):
+    """
+    Berechnet Gesamt-CAPEX aus Komponenten.
+    
+    Args:
+        power_kw: Speicherleistung in kW
+        capacity_kwh: Speicherkapazität in kWh
+        c_E: Energiekomponente in €/kWh
+        c_P: Leistungskomponente in €/kW
+    
+    Returns:
+        Gesamt-CAPEX in €
+    """
+    return c_E * capacity_kwh + c_P * power_kw
+
+
+def render_capex_input_widget(prefix, default_system_price=250, default_duration=2.0):
+    """
+    Rendert ein wiederverwendbares CAPEX-Eingabe-Widget mit zwei Modi.
+    
+    Args:
+        prefix: Eindeutiger Präfix für Session-State-Keys (z.B. 'mode_a', 'mode_b')
+        default_system_price: Standard-Systempreis in €/kWh
+        default_duration: Standard-Referenzdauer in Stunden
+    
+    Returns:
+        dict mit c_E, c_P und weiteren Parametern
+    """
+    st.markdown("#### 💰 Investitionsparameter (CAPEX)")
+    
+    # Hinweisbox zum Kostenmodell
+    with st.expander("ℹ️ Erläuterung zum Kostenmodell"):
+        st.markdown("""
+        **Lineares Kostenmodell nach NREL ATB:**
+        
+        Die Gesamtinvestition setzt sich aus zwei Komponenten zusammen:
+        - **Energiekomponente (c_E):** Kosten für Batteriezellen, BMS, Gehäuse → skaliert mit kWh
+        - **Leistungskomponente (c_P):** Kosten für Wechselrichter, Transformator, Netzanschluss → skaliert mit kW
+        
+        **Formel:** `CAPEX = c_E × Kapazität + c_P × Leistung`
+        
+        **Systempreis:** `c_sys(h) = c_E + c_P / h`  (h = E/P-Verhältnis in Stunden)
+        
+        Bei Angabe eines Systempreises werden die Komponenten basierend auf NREL-Referenzdaten 
+        (Verhältnis ca. 65% Energie / 35% Leistung bei 2h-Speicher) automatisch aufgeteilt.
+        """)
+    
+    # Auswahl des Eingabemodus
+    input_mode = st.radio(
+        "Eingabemodus:",
+        ["Systempreis (€/kWh)", "Detailliert (Energie + Leistung)"],
+        horizontal=True,
+        key=f"{prefix}_capex_mode",
+        help="Systempreis: Ein Wert für das Gesamtsystem. Detailliert: Separate Eingabe für Batterie und Wechselrichter."
+    )
+    
+    if input_mode == "Systempreis (€/kWh)":
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            system_price = st.number_input(
+                "Systempreis (€/kWh)",
+                min_value=50,
+                max_value=1000,
+                value=default_system_price,
+                step=10,
+                key=f"{prefix}_system_price",
+                help="Gesamtkosten pro kWh installierter Speicherkapazität (inkl. Wechselrichter, BOS)"
+            )
+        
+        with col2:
+            reference_duration = st.number_input(
+                "Referenzdauer (h)",
+                min_value=0.5,
+                max_value=8.0,
+                value=default_duration,
+                step=0.5,
+                key=f"{prefix}_ref_duration",
+                help="E/P-Verhältnis, auf das sich der Systempreis bezieht (typisch: 2h oder 4h)"
+            )
+        
+        # Komponenten berechnen
+        components = calculate_capex_components(system_price, reference_duration)
+        c_E = components['c_E']
+        c_P = components['c_P']
+        
+        # Berechnete Werte anzeigen
+        st.markdown("##### Berechnete Kostenkomponenten:")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Energiekomponente", f"{c_E:.0f} €/kWh")
+        with col2:
+            st.metric("Leistungskomponente", f"{c_P:.0f} €/kW")
+        with col3:
+            ratio = c_E / (c_E + c_P / reference_duration) * 100
+            st.metric("Energieanteil", f"{ratio:.0f}%")
+        
+        # Verifikationsrechnung
+        st.caption(f"✓ Verifikation: {c_E:.0f} + {c_P:.0f}/{reference_duration:.1f}h = "
+                  f"{c_E + c_P/reference_duration:.0f} €/kWh")
+        
+    else:  # Detaillierter Modus
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            c_E = st.number_input(
+                "Energiekosten (€/kWh)",
+                min_value=50,
+                max_value=500,
+                value=165,
+                step=5,
+                key=f"{prefix}_c_E",
+                help="Kosten pro kWh: Batteriezellen, BMS, Gehäuse, Thermomanagement"
+            )
+        
+        with col2:
+            c_P = st.number_input(
+                "Leistungskosten (€/kW)",
+                min_value=0,
+                max_value=500,
+                value=170,
+                step=5,
+                key=f"{prefix}_c_P",
+                help="Kosten pro kW: Wechselrichter, Transformator, Netzanschluss"
+            )
+        
+        # Resultierenden Systempreis für verschiedene Dauern anzeigen
+        st.markdown("##### Resultierender Systempreis:")
+        durations = [1, 2, 4]
+        cols = st.columns(len(durations))
+        for col, h in zip(cols, durations):
+            sys_price = c_E + c_P / h
+            with col:
+                st.metric(f"bei {h}h E/P", f"{sys_price:.0f} €/kWh")
+    
+    # In Session State speichern
+    st.session_state[f'{prefix}_c_E'] = c_E
+    st.session_state[f'{prefix}_c_P'] = c_P
+    
+    return {
+        'c_E': c_E,
+        'c_P': c_P,
+        'input_mode': input_mode,
+    }
 
 
 # =============================================================================
@@ -1441,59 +1629,55 @@ def show_mode_a_step1():
     
     st.markdown("---")
     
-    # Investitionsparameter
-    st.markdown("#### 💰 Investitionsparameter (CAPEX)")
+    # Investitionsparameter mit neuem Widget
+    capex_result = render_capex_input_widget(
+        prefix="mode_a",
+        default_system_price=250,
+        default_duration=storage_capacity / storage_power if storage_power > 0 else 2.0
+    )
     
-    col1, col2, col3 = st.columns(3)
+    c_E = capex_result['c_E']
+    c_P = capex_result['c_P']
     
-    with col1:
-        capex_energy = st.number_input(
-            "CAPEX Energie (€/kWh)",
-            min_value=50,
-            max_value=1000,
-            value=250,
-            step=10,
-            help="Investitionskosten pro kWh Speicherkapazität"
-        )
-        st.session_state.capex_energy_a = capex_energy
+    # Für Kompatibilität mit bestehendem Code
+    st.session_state.capex_energy_a = c_E
+    st.session_state.capex_power_a = c_P
     
-    with col2:
-        capex_power = st.number_input(
-            "CAPEX Leistung (€/kW)",
-            min_value=0,
-            max_value=500,
-            value=80,
-            step=10,
-            help="Investitionskosten pro kW Speicherleistung (Wechselrichter, etc.)"
-        )
-        st.session_state.capex_power_a = capex_power
+    st.markdown("---")
     
-    with col3:
-        opex_rate = st.number_input(
-            "OPEX (% von CAPEX/Jahr)",
-            min_value=0.5,
-            max_value=5.0,
-            value=2.0,
-            step=0.5,
-            help="Jährliche Betriebskosten als Prozentsatz der Investition"
-        )
-        st.session_state.opex_rate_a = opex_rate
+    # OPEX-Eingabe
+    st.markdown("#### 🔧 Betriebskosten (OPEX)")
     
-    # CAPEX berechnen und anzeigen
-    total_capex = (storage_capacity * 1000 * capex_energy + 
-                   storage_power * 1000 * capex_power) if is_mw else (
-                   storage_capacity * capex_energy + storage_power * capex_power)
+    opex_rate = st.number_input(
+        "OPEX (% von CAPEX/Jahr)",
+        min_value=0.5,
+        max_value=5.0,
+        value=2.0,
+        step=0.5,
+        help="Jährliche Betriebskosten als Prozentsatz der Investition (typisch: 1,5-2,5%)",
+        key="opex_rate_a_input"
+    )
+    st.session_state.opex_rate_a = opex_rate
     
+    # CAPEX berechnen und anzeigen (jetzt mit korrektem linearen Modell)
+    capacity_kwh = storage_capacity * 1000 if is_mw else storage_capacity
+    power_kw = storage_power * 1000 if is_mw else storage_power
+    
+    total_capex = calculate_total_capex(power_kw, capacity_kwh, c_E, c_P)
     annual_opex = total_capex * opex_rate / 100
     
     st.markdown("##### 💶 Investitionsübersicht")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Gesamt-CAPEX", f"{total_capex:,.0f} €")
     with col2:
-        st.metric("CAPEX pro kWh", f"{total_capex / (storage_capacity * 1000 if is_mw else storage_capacity):,.0f} €/kWh")
+        effective_system_price = total_capex / capacity_kwh
+        st.metric("Effektiver Systempreis", f"{effective_system_price:,.0f} €/kWh")
     with col3:
         st.metric("Jährliche OPEX", f"{annual_opex:,.0f} €/Jahr")
+    with col4:
+        ep_ratio = storage_capacity / storage_power if storage_power > 0 else 0
+        st.metric("E/P-Verhältnis", f"{ep_ratio:.1f} h")
     
     st.session_state.total_capex_a = total_capex
     st.session_state.annual_opex_a = annual_opex
@@ -2782,22 +2966,35 @@ def show_mode_b_step3():
     
     st.markdown("---")
     
-    st.markdown("#### 💶 Investitionsparameter")
+    # Investitionsparameter mit neuem Widget
+    capex_result = render_capex_input_widget(
+        prefix="mode_b",
+        default_system_price=250,
+        default_duration=2.0
+    )
+    
+    c_E = capex_result['c_E']
+    c_P = capex_result['c_P']
+    
+    st.markdown("---")
+    
+    # Weitere wirtschaftliche Parameter
+    st.markdown("#### ⚙️ Weitere Parameter")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        capex_energy = st.number_input("CAPEX Energie (€/kWh)", 50, 1000, 250, 10)
+        project_lifetime = st.number_input("Projektlaufzeit (Jahre)", 5, 25, 15, key="lifetime_b")
     with col2:
-        capex_power = st.number_input("CAPEX Leistung (€/kW)", 0, 500, 80, 10)
+        opex_rate = st.number_input("OPEX (% von CAPEX/Jahr)", 0.5, 5.0, 2.0, 0.5, key="opex_b")
     with col3:
-        project_lifetime = st.number_input("Projektlaufzeit (Jahre)", 5, 25, 15)
+        discount_rate = st.number_input("Kalkulationszins (%)", 1.0, 15.0, 6.0, 0.5, key="discount_b")
     
     st.session_state.economic_params = {
-        'capex_energy': capex_energy,
-        'capex_power': capex_power,
-        'opex_rate': 2.0,
-        'discount_rate': 6.0,
+        'capex_energy': c_E,
+        'capex_power': c_P,
+        'opex_rate': opex_rate,
+        'discount_rate': discount_rate,
         'project_lifetime': project_lifetime,
     }
     
@@ -3962,6 +4159,377 @@ def optimize_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_p
     }
 
 
+def render_parameterstudy_advanced_plots(results_df, c_E, c_P, p_nvp_mw):
+    """
+    Erstellt erweiterte Visualisierungen der Parameterstudie.
+    
+    Zwei Diagramme:
+    1. P-E-Raum: Scatter mit Erfassungsgrad (Farbe) und Iso-Kosten-Linien
+    2. Pareto-Kurve: Trade-off zwischen Erfassungsgrad und CAPEX
+    
+    Args:
+        results_df: DataFrame mit Parameterstudie-Ergebnissen
+        c_E: Energiekosten in €/kWh
+        c_P: Leistungskosten in €/kW
+        p_nvp_mw: NVP-Leistung in MW
+    """
+    # Daten extrahieren
+    P_flat = results_df['storage_power_mw'].values
+    E_flat = results_df['storage_capacity_mwh'].values
+    eta_flat = results_df['capture_rate'].values * 100  # in %
+    ep_flat = results_df['duration_h'].values
+    
+    # CAPEX berechnen (c_E in €/kWh, c_P in €/kW -> umrechnen)
+    CAPEX_flat = (c_P * 1000) * P_flat + (c_E * 1000) * E_flat  # €
+    CAPEX_MEUR = CAPEX_flat / 1e6
+    
+    # =========================================================================
+    # PLOT 1: P-E-Raum mit Iso-Kosten-Linien
+    # =========================================================================
+    st.markdown("#### 📈 Erfassungsgrad im P-E-Raum mit Investitionskosten")
+    
+    fig1, ax1 = plt.subplots(figsize=(11, 7))
+    
+    # Diskrete Farbskala
+    boundaries = [0, 30, 50, 70, 90, 95, 100]
+    cmap = plt.cm.RdYlGn
+    norm = BoundaryNorm(boundaries, cmap.N)
+    
+    # Markergröße nach CAPEX
+    size_min, size_max = 80, 400
+    if CAPEX_MEUR.max() > CAPEX_MEUR.min():
+        capex_norm = (CAPEX_MEUR - CAPEX_MEUR.min()) / (CAPEX_MEUR.max() - CAPEX_MEUR.min())
+    else:
+        capex_norm = np.ones_like(CAPEX_MEUR) * 0.5
+    sizes = size_min + capex_norm * (size_max - size_min)
+    
+    # Scatter-Plot
+    sc = ax1.scatter(P_flat, E_flat, c=eta_flat, s=sizes, cmap=cmap, norm=norm,
+                    edgecolors='black', linewidths=0.5, alpha=0.85, zorder=3)
+    
+    # Iso-Kosten-Linien
+    capex_levels = np.linspace(CAPEX_MEUR.min(), CAPEX_MEUR.max(), 5)
+    capex_levels = [round(x, -1) if x > 10 else round(x, 0) for x in capex_levels]  # Runden
+    capex_levels = sorted(set(capex_levels))  # Duplikate entfernen
+    
+    P_line = np.linspace(0.1, p_nvp_mw * 1.15, 200)
+    
+    for capex in capex_levels:
+        capex_eur = capex * 1e6
+        E_line = (capex_eur - (c_P * 1000) * P_line) / (c_E * 1000)
+        E_line[E_line < 0] = np.nan
+        
+        ax1.plot(P_line, E_line, linestyle='--', linewidth=1.2, 
+                color='gray', alpha=0.6, zorder=1)
+        
+        # Label
+        valid_idx = ~np.isnan(E_line)
+        if valid_idx.any():
+            label_p = min(p_nvp_mw * 0.9, P_line[valid_idx][-1])
+            label_e = (capex_eur - (c_P * 1000) * label_p) / (c_E * 1000)
+            if label_e > 0 and label_e < E_flat.max() * 1.2:
+                ax1.text(label_p + 1, label_e, f'{capex:.0f} Mio. €', 
+                        fontsize=8, color='gray', va='center', ha='left',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                                 edgecolor='none', alpha=0.8))
+    
+    # E/P-Hilfslinien
+    for ep in sorted(results_df['duration_h'].unique()):
+        E_ep = ep * P_line
+        ax1.plot(P_line, E_ep, ':', color='lightblue', linewidth=1, alpha=0.4, zorder=0)
+        ax1.text(p_nvp_mw * 0.98, ep * p_nvp_mw * 0.98, f'E/P={ep:.0f}h', 
+                fontsize=7, color='steelblue', alpha=0.6, ha='right')
+    
+    ax1.set_xlabel('Speicherleistung P [MW]', fontsize=11)
+    ax1.set_ylabel('Speicherkapazität E [MWh]', fontsize=11)
+    ax1.set_title(f'Parameterstudie: Erfassungsgrad und Investitionskosten\n'
+                 f'(NVP = {p_nvp_mw:.0f} MW, Kostenmodell: {c_E:.0f} €/kWh + {c_P:.0f} €/kW)', 
+                 fontsize=11)
+    
+    ax1.set_xlim(0, p_nvp_mw * 1.15)
+    ax1.set_ylim(0, E_flat.max() * 1.15)
+    ax1.grid(True, alpha=0.3, zorder=0)
+    
+    # Farbbalken
+    cbar = plt.colorbar(sc, ax=ax1, label='Erfassungsgrad η [%]',
+                       ticks=[15, 40, 60, 80, 92.5, 97.5])
+    cbar.ax.set_yticklabels(['< 30%', '30-50%', '50-70%', '70-90%', '90-95%', '> 95%'])
+    
+    # Legende für Markergröße
+    legend_capex = [CAPEX_MEUR.min(), (CAPEX_MEUR.min() + CAPEX_MEUR.max())/2, CAPEX_MEUR.max()]
+    legend_handles = []
+    for capex in legend_capex:
+        if CAPEX_MEUR.max() > CAPEX_MEUR.min():
+            cn = (capex - CAPEX_MEUR.min()) / (CAPEX_MEUR.max() - CAPEX_MEUR.min())
+        else:
+            cn = 0.5
+        size = size_min + cn * (size_max - size_min)
+        handle = ax1.scatter([], [], s=size, c='gray', edgecolors='black', 
+                           linewidths=0.5, alpha=0.5, label=f'{capex:.0f} Mio. €')
+        legend_handles.append(handle)
+    
+    legend1 = ax1.legend(handles=legend_handles, title='CAPEX', loc='upper left',
+                        framealpha=0.9, fontsize=9)
+    ax1.add_artist(legend1)
+    
+    plt.tight_layout()
+    st.pyplot(fig1)
+    plt.close()
+    
+    # =========================================================================
+    # PLOT 2: Pareto-Kurve (Trade-off)
+    # =========================================================================
+    st.markdown("#### 📉 Trade-off: Erfassungsgrad vs. Investitionskosten")
+    
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    
+    # Farbpalette für E/P-Verhältnisse
+    unique_eps = sorted(results_df['duration_h'].unique())
+    colors_ep = plt.cm.viridis(np.linspace(0.2, 0.9, len(unique_eps)))
+    markers = ['o', 's', '^', 'D', 'v', 'p', 'h', '*']
+    
+    for i, ep in enumerate(unique_eps):
+        mask = results_df['duration_h'] == ep
+        ep_capex = CAPEX_MEUR[mask]
+        ep_eta = eta_flat[mask]
+        
+        # Sortieren nach CAPEX für Verbindungslinie
+        sort_idx = np.argsort(ep_capex)
+        ep_capex_sorted = ep_capex[sort_idx]
+        ep_eta_sorted = ep_eta[sort_idx]
+        
+        ax2.scatter(ep_capex_sorted, ep_eta_sorted,
+                   c=[colors_ep[i]], marker=markers[i % len(markers)], s=100,
+                   edgecolors='black', linewidths=0.5,
+                   label=f'E/P = {ep:.0f}h')
+        
+        ax2.plot(ep_capex_sorted, ep_eta_sorted,
+                c=colors_ep[i], linewidth=1.5, alpha=0.5)
+    
+    # Sättigungsbereich
+    ax2.axhspan(95, 100, alpha=0.15, color='green', label='Sättigung (>95%)')
+    ax2.axhline(y=95, color='green', linestyle='--', linewidth=1, alpha=0.5)
+    
+    ax2.set_xlabel('Investitionskosten CAPEX [Mio. €]', fontsize=11)
+    ax2.set_ylabel('Erfassungsgrad η [%]', fontsize=11)
+    ax2.set_title('Trade-off: Erfassungsgrad vs. Investitionskosten\n'
+                 'Linien verbinden Konfigurationen mit gleichem E/P-Verhältnis', fontsize=11)
+    
+    ax2.set_xlim(0, CAPEX_MEUR.max() * 1.1)
+    ax2.set_ylim(0, 105)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='lower right', fontsize=9)
+    
+    plt.tight_layout()
+    st.pyplot(fig2)
+    plt.close()
+    
+    # Kurze Erläuterung
+    with st.expander("ℹ️ Interpretation der Diagramme"):
+        st.markdown("""
+        **P-E-Raum (oben):**
+        - Jeder Punkt repräsentiert eine Speicherkonfiguration aus der Parameterstudie
+        - **Farbe** = Erfassungsgrad (grün = hoch, rot = niedrig)
+        - **Größe** = Investitionskosten (größer = teurer)
+        - **Gestrichelte Linien** = Iso-Kosten-Linien (alle Punkte auf einer Linie kosten gleich viel)
+        - **Gepunktete Linien** = Konstantes E/P-Verhältnis
+        
+        **Trade-off-Diagramm (unten):**
+        - Zeigt den Zusammenhang zwischen Investition und Erfassungsgrad
+        - Jede Linie verbindet Konfigurationen mit gleichem E/P-Verhältnis
+        - Der **grüne Bereich** markiert Sättigung (>95% Erfassung)
+        - **Abflachende Kurven** zeigen abnehmenden Grenznutzen
+        """)
+
+
+def render_economic_evaluation_plot(results_df, electricity_price, project_lifetime, discount_rate):
+    """
+    Erstellt Wirtschaftlichkeits-Visualisierungen für die Parameterstudie.
+    
+    Plots:
+    1. Erfassungsgrad vs. NPV (Scatter mit E/P-Gruppen)
+    2. Break-Even-Preis-Analyse
+    
+    Args:
+        results_df: DataFrame mit Parameterstudie-Ergebnissen inkl. NPV, break_even_price
+        electricity_price: Verwendeter Strompreis (€/MWh)
+        project_lifetime: Projektlaufzeit (Jahre)
+        discount_rate: Kalkulationszins (dezimal)
+    """
+    
+    # Prüfen ob Wirtschaftlichkeitsdaten vorhanden
+    if 'npv' not in results_df.columns:
+        st.warning("⚠️ Keine Wirtschaftlichkeitsdaten vorhanden.")
+        return
+    
+    st.markdown("#### 💰 Wirtschaftlichkeitsbewertung")
+    
+    # Filter für sinnvolle Werte
+    df = results_df.copy()
+    df['npv_mio'] = df['npv'] / 1e6  # In Mio. €
+    
+    # =========================================================================
+    # PLOT 1: Erfassungsgrad vs. NPV
+    # =========================================================================
+    st.markdown("##### Erfassungsgrad vs. Kapitalwert (NPV)")
+    
+    fig1, ax1 = plt.subplots(figsize=(11, 7))
+    
+    # Farbpalette für E/P-Verhältnisse
+    unique_eps = sorted(df['duration_h'].unique())
+    colors_ep = plt.cm.viridis(np.linspace(0.2, 0.9, len(unique_eps)))
+    markers = ['o', 's', '^', 'D', 'v', 'p', 'h', '*']
+    
+    for i, ep in enumerate(unique_eps):
+        mask = df['duration_h'] == ep
+        subset = df[mask]
+        
+        ax1.scatter(subset['capture_rate'] * 100, subset['npv_mio'],
+                   c=[colors_ep[i]], marker=markers[i % len(markers)], s=100,
+                   edgecolors='black', linewidths=0.5,
+                   label=f'E/P = {ep:.0f}h')
+        
+        # Verbindungslinie (sortiert nach capture_rate)
+        sorted_subset = subset.sort_values('capture_rate')
+        ax1.plot(sorted_subset['capture_rate'] * 100, sorted_subset['npv_mio'],
+                c=colors_ep[i], linewidth=1.5, alpha=0.5)
+    
+    # Wirtschaftlichkeitsschwelle (NPV = 0)
+    ax1.axhline(y=0, color='red', linestyle='--', linewidth=2, label='Wirtschaftlichkeitsschwelle (NPV=0)')
+    ax1.axhspan(0, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 0 else 1, alpha=0.1, color='green')
+    ax1.axhspan(ax1.get_ylim()[0] if ax1.get_ylim()[0] < 0 else -1, 0, alpha=0.1, color='red')
+    
+    ax1.set_xlabel('Erfassungsgrad η [%]', fontsize=11)
+    ax1.set_ylabel('Kapitalwert NPV [Mio. €]', fontsize=11)
+    ax1.set_title(f'Wirtschaftlichkeit vs. technische Effizienz\n'
+                 f'(Strompreis: {electricity_price:.0f} €/MWh, Laufzeit: {project_lifetime} Jahre, '
+                 f'Zins: {discount_rate*100:.1f}%)', fontsize=11)
+    
+    ax1.set_xlim(0, 105)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='best', fontsize=9)
+    
+    # Annotation für wirtschaftlichste Konfiguration
+    if df['npv'].max() > 0:
+        best_idx = df['npv'].idxmax()
+        best = df.loc[best_idx]
+        ax1.annotate(f'Beste: {best["capture_rate"]*100:.0f}%, NPV={best["npv_mio"]:.1f} Mio.€',
+                    xy=(best['capture_rate'] * 100, best['npv_mio']),
+                    xytext=(best['capture_rate'] * 100 - 15, best['npv_mio'] + 0.5),
+                    fontsize=9, ha='center',
+                    arrowprops=dict(arrowstyle='->', color='green', lw=1.5),
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', 
+                             edgecolor='green', alpha=0.9))
+    
+    plt.tight_layout()
+    st.pyplot(fig1)
+    plt.close()
+    
+    # =========================================================================
+    # PLOT 2: Break-Even-Preis vs. Erfassungsgrad
+    # =========================================================================
+    st.markdown("##### Break-Even-Strompreis")
+    
+    # Filter unrealistische Werte
+    df_be = df[df['break_even_price'] < 500].copy()  # Max 500 €/MWh
+    
+    if len(df_be) > 0:
+        fig2, ax2 = plt.subplots(figsize=(11, 6))
+        
+        for i, ep in enumerate(unique_eps):
+            mask = df_be['duration_h'] == ep
+            subset = df_be[mask]
+            
+            if len(subset) > 0:
+                sorted_subset = subset.sort_values('capture_rate')
+                ax2.scatter(sorted_subset['capture_rate'] * 100, sorted_subset['break_even_price'],
+                           c=[colors_ep[i]], marker=markers[i % len(markers)], s=80,
+                           edgecolors='black', linewidths=0.5,
+                           label=f'E/P = {ep:.0f}h')
+                ax2.plot(sorted_subset['capture_rate'] * 100, sorted_subset['break_even_price'],
+                        c=colors_ep[i], linewidth=1.5, alpha=0.5)
+        
+        # Aktueller Strompreis
+        ax2.axhline(y=electricity_price, color='green', linestyle='--', linewidth=2, 
+                   label=f'Aktueller Preis ({electricity_price:.0f} €/MWh)')
+        
+        # Bereich unter aktuellem Preis = wirtschaftlich
+        ax2.axhspan(0, electricity_price, alpha=0.15, color='green')
+        ax2.axhspan(electricity_price, ax2.get_ylim()[1], alpha=0.1, color='red')
+        
+        ax2.set_xlabel('Erfassungsgrad η [%]', fontsize=11)
+        ax2.set_ylabel('Break-Even-Strompreis [€/MWh]', fontsize=11)
+        ax2.set_title('Mindest-Strompreis für Wirtschaftlichkeit (NPV ≥ 0)\n'
+                     'Konfigurationen unterhalb der grünen Linie sind wirtschaftlich', fontsize=11)
+        
+        ax2.set_xlim(0, 105)
+        ax2.set_ylim(0, min(df_be['break_even_price'].max() * 1.1, 400))
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right', fontsize=9)
+        
+        plt.tight_layout()
+        st.pyplot(fig2)
+        plt.close()
+    
+    # =========================================================================
+    # Zusammenfassung und Empfehlung
+    # =========================================================================
+    st.markdown("##### 📋 Wirtschaftliche Zusammenfassung")
+    
+    # Wirtschaftliche Konfigurationen (NPV > 0)
+    profitable = df[df['npv'] > 0]
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("Wirtschaftliche Konfigurationen", 
+                 f"{len(profitable)} von {len(df)}",
+                 help="Anzahl Konfigurationen mit NPV > 0")
+        
+        if len(profitable) > 0:
+            best_npv = profitable.loc[profitable['npv'].idxmax()]
+            st.success(f"**Höchster NPV:** {best_npv['npv']/1e6:.2f} Mio. €\n\n"
+                      f"P = {best_npv['storage_power_mw']:.1f} MW, "
+                      f"E = {best_npv['storage_capacity_mwh']:.0f} MWh, "
+                      f"η = {best_npv['capture_rate']*100:.0f}%")
+        else:
+            st.error("Keine wirtschaftliche Konfiguration bei aktuellen Annahmen")
+    
+    with col2:
+        # Mindest-Break-Even-Preis
+        min_be = df['break_even_price'].min()
+        if min_be < float('inf'):
+            st.metric("Niedrigster Break-Even-Preis", 
+                     f"{min_be:.0f} €/MWh",
+                     help="Mindest-Strompreis für irgendeine wirtschaftliche Konfiguration")
+            
+            if min_be <= electricity_price:
+                st.success(f"✓ Wirtschaftlichkeit bei {electricity_price:.0f} €/MWh möglich")
+            else:
+                st.warning(f"⚠️ Benötigt mindestens {min_be:.0f} €/MWh für Wirtschaftlichkeit")
+    
+    # Empfehlung: Wirtschaftlichste Konfiguration mit mindestens 80% Erfassung
+    high_capture_profitable = df[(df['npv'] > 0) & (df['capture_rate'] >= 0.8)]
+    
+    if len(high_capture_profitable) > 0:
+        recommended = high_capture_profitable.loc[high_capture_profitable['npv'].idxmax()]
+        st.markdown("---")
+        st.markdown("##### 🎯 Empfohlene Konfiguration")
+        st.markdown(f"""
+        **Kriterium:** Höchster NPV bei Erfassungsgrad ≥ 80%
+        
+        | Parameter | Wert |
+        |-----------|------|
+        | Speicherleistung | {recommended['storage_power_mw']:.1f} MW |
+        | Speicherkapazität | {recommended['storage_capacity_mwh']:.0f} MWh |
+        | E/P-Verhältnis | {recommended['duration_h']:.0f} h |
+        | Erfassungsgrad | {recommended['capture_rate']*100:.1f}% |
+        | **NPV** | **{recommended['npv']/1e6:.2f} Mio. €** |
+        | CAPEX | {recommended['capex']/1e6:.2f} Mio. € |
+        | Amortisation | {recommended['payback_years']:.1f} Jahre |
+        | Break-Even-Preis | {recommended['break_even_price']:.0f} €/MWh |
+        """)
+
 
 def show_mode_c():
     """Zeigt den Ablauf für Modus C: NVP-Überbauung."""
@@ -4042,7 +4610,7 @@ def show_mode_c_step1():
         st.session_state.unit_display = unit_nvp  # Separater Key für Anzeige
     
     with col2:
-        st.markdown("#### 🌬️ Installierte Erzeugungsleistung")
+        st.markdown("#### 🌬️ Installierte Windleistung")
         
         p_wind_inst = st.number_input(
             f"Installierte Windleistung ({unit_nvp})",
@@ -4053,26 +4621,96 @@ def show_mode_c_step1():
             help="Nennleistung der Windenergieanlagen"
         )
         
-        p_pv_inst = st.number_input(
-            f"Installierte PV-Leistung ({unit_nvp})",
-            min_value=0.0,
-            max_value=50000.0,
-            value=10.0 if unit_nvp == "MW" else 1000.0,
-            step=1.0,
-            help="Installierte Leistung der PV-Anlage"
-        )
-        
         # In MW umrechnen
         p_wind_inst_mw = p_wind_inst if unit_nvp == "MW" else p_wind_inst / 1000
-        p_pv_inst_mw = p_pv_inst if unit_nvp == "MW" else p_pv_inst / 1000
-        
         st.session_state.p_wind_inst_mw = p_wind_inst_mw
-        st.session_state.p_pv_inst_mw = p_pv_inst_mw
+    
+    st.markdown("---")
+    
+    # === MEHRERE PV-ANLAGEN ===
+    st.markdown("#### ☀️ PV-Anlagen (mehrere Ausrichtungen möglich)")
+    
+    st.markdown("""
+    <div class="info-box">
+        <strong>Verschiedene PV-Ausrichtungen:</strong> Für eine realistische Simulation können 
+        mehrere PV-Anlagen mit unterschiedlichen Ausrichtungen (Süd, Ost, West, Agri-PV) 
+        separat konfiguriert werden. Jede Anlage benötigt ein eigenes Erzeugungsprofil.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Initialisierung
+    if 'pv_anlagen' not in st.session_state:
+        st.session_state.pv_anlagen = []
+    
+    # Anzahl PV-Anlagen
+    num_pv = st.number_input(
+        "Anzahl PV-Anlagen/Ausrichtungen",
+        min_value=0, max_value=5, value=len(st.session_state.pv_anlagen) if st.session_state.pv_anlagen else 1,
+        help="0 = keine PV, 1-5 = verschiedene Ausrichtungen (z.B. Süd, Ost, West)"
+    )
+    
+    # PV-Anlagen konfigurieren
+    pv_anlagen = []
+    p_pv_total_mw = 0
+    
+    if num_pv > 0:
+        ausrichtung_optionen = ["Süd (30°)", "Ost (90° Agri-PV)", "West (90° Agri-PV)", 
+                                "Süd-Ost", "Süd-West", "Horizontal (0°)", "Sonstige"]
+        
+        cols = st.columns(min(num_pv, 3))
+        
+        for i in range(num_pv):
+            col_idx = i % 3
+            with cols[col_idx]:
+                st.markdown(f"**PV-Anlage {i+1}**")
+                
+                # Default-Werte aus vorheriger Konfiguration
+                default_name = st.session_state.pv_anlagen[i]['name'] if i < len(st.session_state.pv_anlagen) else ausrichtung_optionen[min(i, len(ausrichtung_optionen)-1)]
+                default_power = st.session_state.pv_anlagen[i]['power_mw'] if i < len(st.session_state.pv_anlagen) else 10.0
+                
+                ausrichtung = st.selectbox(
+                    "Ausrichtung",
+                    ausrichtung_optionen,
+                    index=ausrichtung_optionen.index(default_name) if default_name in ausrichtung_optionen else 0,
+                    key=f"pv_ausrichtung_{i}"
+                )
+                
+                p_pv = st.number_input(
+                    f"Leistung ({unit_nvp})",
+                    min_value=0.1 if unit_nvp == "MW" else 1.0,
+                    max_value=50000.0,
+                    value=default_power if unit_nvp == "MW" else default_power * 1000,
+                    step=1.0,
+                    key=f"pv_power_{i}"
+                )
+                
+                p_pv_mw = p_pv if unit_nvp == "MW" else p_pv / 1000
+                
+                pv_anlagen.append({
+                    'name': ausrichtung,
+                    'power_mw': p_pv_mw,
+                    'index': i
+                })
+                p_pv_total_mw += p_pv_mw
+        
+        # Zusammenfassung
+        st.markdown("---")
+        st.markdown("##### Zusammenfassung PV-Anlagen")
+        pv_summary = pd.DataFrame(pv_anlagen)
+        pv_summary.columns = ['Ausrichtung', 'Leistung (MW)', 'Nr.']
+        pv_summary = pv_summary[['Nr.', 'Ausrichtung', 'Leistung (MW)']]
+        pv_summary['Nr.'] = pv_summary['Nr.'] + 1
+        st.dataframe(pv_summary, use_container_width=True, hide_index=True)
+        st.metric("Gesamt-PV-Leistung", f"{p_pv_total_mw:.2f} MW")
+    
+    # Speichern
+    st.session_state.pv_anlagen = pv_anlagen
+    st.session_state.p_pv_inst_mw = p_pv_total_mw
     
     st.markdown("---")
     
     # Überbauungsfaktor anzeigen
-    p_ee_total = p_wind_inst_mw + p_pv_inst_mw
+    p_ee_total = p_wind_inst_mw + p_pv_total_mw
     overbuild_factor = p_ee_total / p_nvp_mw if p_nvp_mw > 0 else 0
     
     col1, col2, col3, col4 = st.columns(4)
@@ -4096,23 +4734,59 @@ def show_mode_c_step1():
     
     st.markdown("---")
     
-    # Speicherparameter
-    st.markdown("#### 🔋 Speicherparameter")
+    # Speicherparameter (technisch)
+    st.markdown("#### 🔋 Technische Speicherparameter")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        eta_charge = st.slider("Ladewirkungsgrad (%)", 80, 99, 95) / 100
-        eta_discharge = st.slider("Entladewirkungsgrad (%)", 80, 99, 95) / 100
+        eta_charge = st.slider("Ladewirkungsgrad (%)", 80, 99, 95, key="eta_c_charge") / 100
+        eta_discharge = st.slider("Entladewirkungsgrad (%)", 80, 99, 95, key="eta_c_discharge") / 100
     
     with col2:
-        cost_power = st.number_input("Leistungskosten (€/kW)", 0, 500, 80)
-        cost_energy = st.number_input("Kapazitätskosten (€/kWh)", 50, 1000, 200)
+        soc_min_c = st.slider("Minimaler SOC (%)", 0, 30, 10, key="soc_min_c") / 100
+        soc_max_c = st.slider("Maximaler SOC (%)", 70, 100, 90, key="soc_max_c") / 100
     
+    # Werte in separaten Keys speichern (nicht unter Widget-Keys)
     st.session_state.eta_charge = eta_charge
     st.session_state.eta_discharge = eta_discharge
-    st.session_state.cost_power = cost_power
-    st.session_state.cost_energy = cost_energy
+    st.session_state.soc_min_c_val = soc_min_c
+    st.session_state.soc_max_c_val = soc_max_c
+    
+    st.markdown("---")
+    
+    # Investitionsparameter mit neuem Widget
+    capex_result = render_capex_input_widget(
+        prefix="mode_c",
+        default_system_price=250,
+        default_duration=2.0
+    )
+    
+    c_E = capex_result['c_E']
+    c_P = capex_result['c_P']
+    
+    # Für Kompatibilität mit bestehendem Code
+    st.session_state.cost_power = c_P
+    st.session_state.cost_energy = c_E
+    
+    st.markdown("---")
+    
+    # Weitere wirtschaftliche Parameter
+    st.markdown("#### ⚙️ Weitere wirtschaftliche Parameter")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        project_lifetime_c = st.number_input("Projektlaufzeit (Jahre)", 5, 25, 15, key="lifetime_c")
+    with col2:
+        opex_rate_c = st.number_input("OPEX (% von CAPEX/Jahr)", 0.5, 5.0, 2.0, 0.5, key="opex_c")
+    with col3:
+        discount_rate_c = st.number_input("Kalkulationszins (%)", 1.0, 15.0, 6.0, 0.5, key="discount_c")
+    
+    # Werte in separaten Keys speichern
+    st.session_state.project_lifetime_c_val = project_lifetime_c
+    st.session_state.opex_rate_c_val = opex_rate_c
+    st.session_state.discount_rate_c_val = discount_rate_c
     
     st.markdown("---")
     
@@ -4185,46 +4859,94 @@ def show_mode_c_step2():
             st.session_state.wind_profile_c = None
     
     with col2:
-        st.markdown("#### ☀️ PV-Profil")
+        st.markdown("#### ☀️ PV-Profile")
         
-        if st.session_state.p_pv_inst_mw > 0:
-            pv_file = st.file_uploader(
-                "PV-Profil hochladen",
-                type=['csv', 'xlsx', 'xls'],
-                key="pv_upload_c",
-                help="Zeitreihe mit PV-Leistung"
-            )
+        pv_anlagen = st.session_state.get('pv_anlagen', [])
+        
+        if len(pv_anlagen) > 0:
+            # Initialisiere Dictionary für PV-Profile falls nicht vorhanden
+            if 'pv_profiles_c' not in st.session_state:
+                st.session_state.pv_profiles_c = {}
             
-            if pv_file is not None:
-                df = load_csv_file(pv_file)
-                if df is not None:
-                    # Normieren falls nötig
-                    values = df.iloc[:, 0].values
-                    if values.max() > 1.5:  # Wahrscheinlich absolute Werte
-                        is_normalized = st.radio(
-                            "Sind die Werte normiert (0-1)?",
-                            ["Nein, absolute Werte", "Ja, bereits normiert"],
-                            key="pv_norm"
-                        )
-                        if is_normalized == "Nein, absolute Werte":
-                            values = values / values.max()
+            for anlage in pv_anlagen:
+                idx = anlage['index']
+                name = anlage['name']
+                power = anlage['power_mw']
+                
+                st.markdown(f"**{name}** ({power:.1f} MW)")
+                
+                pv_file = st.file_uploader(
+                    f"Profil für {name}",
+                    type=['csv', 'xlsx', 'xls'],
+                    key=f"pv_upload_c_{idx}",
+                    help=f"Zeitreihe mit PV-Leistung für {name}"
+                )
+                
+                if pv_file is not None:
+                    df = load_csv_file(pv_file)
+                    if df is not None:
+                        values = df.iloc[:, 0].values
+                        
+                        # Normieren falls nötig
+                        if values.max() > 1.5:
+                            is_normalized = st.radio(
+                                f"Sind die Werte für {name} normiert (0-1)?",
+                                ["Nein, absolute Werte", "Ja, bereits normiert"],
+                                key=f"pv_norm_{idx}"
+                            )
+                            if is_normalized == "Nein, absolute Werte":
+                                values = values / values.max()
+                        
+                        # Speichern mit Anlageninformationen
+                        st.session_state.pv_profiles_c[idx] = {
+                            'profile': pd.Series(values, index=df.index),
+                            'name': name,
+                            'power_mw': power
+                        }
+                        
+                        # Zeitauflösung erkennen
+                        if 'time_resolution_c' not in st.session_state:
+                            time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                            st.session_state.time_resolution_c = time_res
+                        else:
+                            time_res = st.session_state.time_resolution_c
+                        
+                        st.success(f"✓ {len(df)} Datenpunkte ({time_res['resolution']})")
+                
+                st.markdown("---")
+            
+            # Zusammenfassung der hochgeladenen Profile
+            loaded_profiles = st.session_state.get('pv_profiles_c', {})
+            if len(loaded_profiles) > 0:
+                st.markdown("##### ✓ Geladene PV-Profile")
+                for idx, data in loaded_profiles.items():
+                    st.caption(f"• {data['name']}: {data['power_mw']:.1f} MW")
+            
+            # Kombination für Kompatibilität mit altem Code
+            if len(loaded_profiles) == len(pv_anlagen):
+                # Alle Profile geladen - kombinieren
+                combined_pv = None
+                total_pv_power = 0
+                
+                for idx, data in loaded_profiles.items():
+                    profile = data['profile'].values
+                    power = data['power_mw']
                     
-                    st.session_state.pv_profile_c = pd.Series(values, index=df.index)
-                    
-                    # Zeitauflösung erkennen und speichern (falls noch nicht durch Wind gesetzt)
-                    if 'time_resolution_c' not in st.session_state:
-                        time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
-                        st.session_state.time_resolution_c = time_res
+                    if combined_pv is None:
+                        combined_pv = profile * power
                     else:
-                        time_res = st.session_state.time_resolution_c
-                    
-                    st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
-                    
-                    with st.expander("Vorschau"):
-                        st.line_chart(st.session_state.pv_profile_c.iloc[:min(1000, len(df))])
+                        combined_pv = combined_pv + profile * power
+                    total_pv_power += power
+                
+                # Normieren für Gesamtleistung
+                if total_pv_power > 0:
+                    combined_pv_norm = combined_pv / total_pv_power
+                    st.session_state.pv_profile_c = pd.Series(combined_pv_norm)
+                    st.success(f"✅ Alle {len(pv_anlagen)} PV-Profile kombiniert (Gesamt: {total_pv_power:.1f} MW)")
         else:
-            st.info("Keine PV-Leistung konfiguriert")
+            st.info("Keine PV-Anlagen konfiguriert")
             st.session_state.pv_profile_c = None
+            st.session_state.pv_profiles_c = {}
     
     st.markdown("---")
     
@@ -4339,17 +5061,25 @@ def show_mode_c_step2():
         has_wind = st.session_state.get('wind_profile_c') is not None
         has_pv = st.session_state.get('pv_profile_c') is not None
         
+        # Prüfen ob alle PV-Profile geladen wurden
+        pv_anlagen = st.session_state.get('pv_anlagen', [])
+        pv_profiles = st.session_state.get('pv_profiles_c', {})
+        all_pv_loaded = len(pv_profiles) == len(pv_anlagen) if len(pv_anlagen) > 0 else True
+        
         # Prüfen ob Preise benötigt aber nicht vorhanden
         needs_prices = st.session_state.get('use_price_opt_c', False)
         has_prices = st.session_state.get('da_prices_c') is not None
         
-        if (has_wind or has_pv) and (not needs_prices or has_prices):
+        if (has_wind or has_pv) and all_pv_loaded and (not needs_prices or has_prices):
             if st.button("Weiter →", type="primary", use_container_width=True):
                 st.session_state.current_step = 3
                 st.rerun()
         else:
             if not (has_wind or has_pv):
                 st.warning("⚠️ Bitte laden Sie mindestens ein Erzeugungsprofil hoch")
+            elif not all_pv_loaded:
+                missing = len(pv_anlagen) - len(pv_profiles)
+                st.warning(f"⚠️ Noch {missing} von {len(pv_anlagen)} PV-Profilen fehlen")
             elif needs_prices and not has_prices:
                 st.warning("⚠️ Bitte laden Sie Day-Ahead-Preise hoch oder deaktivieren Sie die Preisoptimierung")
 
@@ -4728,18 +5458,110 @@ def show_mode_c_step4():
             st.markdown("#### Speicherleistung")
             power_min = st.slider("Min. Leistung (% von NVP)", 0, 50, 10)
             power_max = st.slider("Max. Leistung (% von NVP)", 50, 150, 100)
-            power_steps = st.number_input("Anzahl Schritte (Leistung)", 3, 10, 5,
-                                         help="Weniger Schritte = schnellere Berechnung")
+            power_steps = st.number_input("Anzahl Schritte (Leistung)", 3, 20, 5,
+                                         help="Mehr Schritte = feinere Auflösung, aber längere Rechenzeit")
         
         with col2:
             st.markdown("#### Speicherdauer (E/P)")
             duration_min = st.slider("Min. Dauer (h)", 1, 5, 1)
             duration_max = st.slider("Max. Dauer (h)", 5, 20, 8)
-            duration_steps = st.number_input("Anzahl Schritte (Dauer)", 3, 10, 4,
-                                            help="Weniger Schritte = schnellere Berechnung")
+            duration_steps = st.number_input("Anzahl Schritte (Dauer)", 3, 20, 4,
+                                            help="Mehr Schritte = feinere Auflösung, aber längere Rechenzeit")
         
         total_combinations = int(power_steps) * int(duration_steps)
-        st.warning(f"⚠️ {total_combinations} Kombinationen = ca. {total_combinations * 30 // 60} Minuten Rechenzeit")
+        
+        # Warnung je nach Anzahl Kombinationen
+        if total_combinations <= 25:
+            st.success(f"✓ {total_combinations} Kombinationen – schnelle Berechnung (< 2 Minuten)")
+        elif total_combinations <= 50:
+            st.info(f"ℹ️ {total_combinations} Kombinationen – ca. {total_combinations * 2 // 60} - {total_combinations * 3 // 60 + 1} Minuten")
+        elif total_combinations <= 100:
+            st.warning(f"⚠️ {total_combinations} Kombinationen – ca. {total_combinations * 2 // 60} - {total_combinations * 3 // 60 + 1} Minuten")
+        else:
+            st.error(f"🔴 {total_combinations} Kombinationen – lange Rechenzeit (> {total_combinations * 2 // 60} Minuten). Schritte reduzieren empfohlen.")
+        
+        st.markdown("---")
+        
+        # === WIRTSCHAFTLICHE PARAMETER ===
+        st.markdown("#### 💰 Wirtschaftliche Parameter")
+        
+        with st.expander("ℹ️ Erläuterung zur Wirtschaftlichkeitsbewertung", expanded=False):
+            st.markdown("""
+            **Erlösmodell:** Der Speicher ermöglicht zusätzliche Netzeinspeisung, die sonst abgeregelt würde.
+            
+            **Jährlicher Erlös** = Zusätzliche Einspeisung × Strompreis
+            
+            **NPV (Kapitalwert)** = Σ (Erlös - Kosten) / (1+r)^t
+            - NPV > 0: Investition wirtschaftlich
+            - NPV < 0: Investition unwirtschaftlich
+            
+            **Break-Even-Preis** = Mindest-Strompreis für NPV = 0
+            """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            project_lifetime_ps = st.number_input(
+                "Projektlaufzeit (Jahre)", 
+                min_value=5, max_value=25, value=15,
+                key="lifetime_ps",
+                help="Kalkulatorische Nutzungsdauer des Speichers"
+            )
+            
+            discount_rate_ps = st.number_input(
+                "Kalkulationszins (%)", 
+                min_value=1.0, max_value=15.0, value=6.0, step=0.5,
+                key="discount_ps",
+                help="Gewichteter Kapitalkostensatz (WACC)"
+            ) / 100
+        
+        with col2:
+            opex_rate_ps = st.number_input(
+                "OPEX (% von CAPEX/Jahr)", 
+                min_value=0.5, max_value=5.0, value=2.0, step=0.5,
+                key="opex_ps",
+                help="Jährliche Betriebskosten als Prozentsatz der Investition"
+            ) / 100
+            
+            # Strompreis-Option
+            da_prices_available = st.session_state.get('da_prices_c') is not None
+            
+            if da_prices_available:
+                price_source = st.radio(
+                    "Strompreis für Erlösrechnung:",
+                    ["Fester Durchschnittspreis", "Aus Day-Ahead-Preisen"],
+                    horizontal=True,
+                    key="price_source_ps",
+                    help="Day-Ahead: Verwendet die hochgeladenen Preise für realistische Erlösschätzung"
+                )
+            else:
+                price_source = "Fester Durchschnittspreis"
+                st.caption("ℹ️ Day-Ahead-Preise nicht hochgeladen – fester Preis wird verwendet")
+        
+        # Strompreis-Eingabe
+        if price_source == "Fester Durchschnittspreis":
+            electricity_price = st.number_input(
+                "Strompreis (€/MWh)",
+                min_value=20.0, max_value=300.0, value=80.0, step=5.0,
+                key="elec_price_ps",
+                help="Durchschnittlicher Verkaufspreis für eingespeisten Strom"
+            )
+            use_da_prices_for_revenue = False
+        else:
+            da_prices = st.session_state.get('da_prices_c')
+            avg_price = da_prices.mean() if da_prices is not None else 80
+            st.info(f"📊 Day-Ahead-Preise: Ø {avg_price:.1f} €/MWh (Min: {da_prices.min():.1f}, Max: {da_prices.max():.1f})")
+            electricity_price = avg_price  # Fallback für Break-Even-Berechnung
+            use_da_prices_for_revenue = True
+        
+        # Kostenparameter aus Session State
+        c_E = st.session_state.get('cost_energy', 165)  # €/kWh
+        c_P = st.session_state.get('cost_power', 170)   # €/kW
+        
+        st.caption(f"💶 Kostenmodell: {c_E:.0f} €/kWh + {c_P:.0f} €/kW (aus Schritt 1)")
+        
+        # Annuitätenfaktor berechnen
+        annuity_factor = calculate_annuity_factor(discount_rate_ps, project_lifetime_ps)
         
         st.markdown("---")
         
@@ -4798,6 +5620,76 @@ def show_mode_c_step4():
                         'discharged_mwh': sim['total_discharged_mwh'],
                     }
                     
+                    # === WIRTSCHAFTLICHKEITSBERECHNUNG ===
+                    # CAPEX berechnen (c_E in €/kWh, c_P in €/kW)
+                    capex = (c_E * storage_capacity * 1000) + (c_P * storage_power * 1000)  # €
+                    
+                    # Jährlicher OPEX
+                    annual_opex = capex * opex_rate_ps
+                    
+                    # Zusätzliche Einspeisung (= vermiedene Abregelung)
+                    # Überschuss ohne Speicher = surplus_mwh
+                    # Abregelung mit Speicher = curtailment_mwh
+                    additional_feed_in = sim['total_surplus_mwh'] - sim['total_curtailment_mwh']
+                    
+                    # Jährlicher Erlös
+                    if use_da_prices_for_revenue and da_prices is not None:
+                        # Bei DA-Preisen: verwende den durchschnittlichen Entladepreis
+                        avg_price = sim.get('avg_discharge_price', electricity_price)
+                        if avg_price is None or avg_price == 0:
+                            avg_price = electricity_price
+                        annual_revenue = additional_feed_in * avg_price
+                    else:
+                        # Fester Strompreis
+                        annual_revenue = additional_feed_in * electricity_price
+                        avg_price = electricity_price
+                    
+                    # Jährliche Annuität der Investition
+                    annual_capex = capex * annuity_factor
+                    
+                    # Jährlicher Netto-Cashflow
+                    annual_net_cashflow = annual_revenue - annual_capex - annual_opex
+                    
+                    # NPV berechnen (vereinfacht: gleiche Cashflows über Laufzeit)
+                    # NPV = -CAPEX + Σ (Erlös - OPEX) / (1+r)^t
+                    npv = -capex
+                    for year in range(1, project_lifetime_ps + 1):
+                        npv += (annual_revenue - annual_opex) / ((1 + discount_rate_ps) ** year)
+                    
+                    # Break-Even-Preis berechnen (welcher Strompreis für NPV = 0?)
+                    # NPV = 0 => -CAPEX + Σ (p_be * additional_feed_in - OPEX) / (1+r)^t = 0
+                    # => p_be = (CAPEX * ANF + OPEX) / additional_feed_in
+                    if additional_feed_in > 0:
+                        total_annual_cost = annual_capex + annual_opex
+                        break_even_price = total_annual_cost / additional_feed_in
+                    else:
+                        break_even_price = float('inf')
+                    
+                    # Amortisationszeit (einfach)
+                    if annual_revenue > annual_opex:
+                        payback_years = capex / (annual_revenue - annual_opex)
+                    else:
+                        payback_years = float('inf')
+                    
+                    # LCOS (Levelized Cost of Storage)
+                    if sim['total_discharged_mwh'] > 0:
+                        # LCOS = Gesamtkosten / Gesamte entladene Energie über Laufzeit
+                        total_costs = capex + annual_opex * project_lifetime_ps
+                        total_discharged = sim['total_discharged_mwh'] * project_lifetime_ps
+                        lcos = total_costs / total_discharged
+                    else:
+                        lcos = float('inf')
+                    
+                    result_entry['capex'] = capex
+                    result_entry['annual_revenue'] = annual_revenue
+                    result_entry['annual_opex'] = annual_opex
+                    result_entry['npv'] = npv
+                    result_entry['break_even_price'] = break_even_price
+                    result_entry['payback_years'] = payback_years
+                    result_entry['lcos'] = lcos
+                    result_entry['additional_feed_in'] = additional_feed_in
+                    result_entry['avg_price_used'] = avg_price
+                    
                     if da_prices is not None:
                         result_entry['discharge_revenue'] = sim.get('total_discharge_revenue', 0)
                         result_entry['avg_discharge_price'] = sim.get('avg_discharge_price')
@@ -4855,21 +5747,74 @@ def show_mode_c_step4():
             st.pyplot(fig)
             plt.close()
             
-            # Tabelle mit besten Konfigurationen
-            st.markdown("#### 🏆 Top 5 Konfigurationen (nach Erfassungsgrad)")
+            # Erweiterte Visualisierungen (P-E-Raum und Pareto-Kurve)
+            st.markdown("---")
             
-            top5 = results.nlargest(5, 'capture_rate')[
-                ['storage_power_mw', 'storage_capacity_mwh', 'duration_h', 
-                 'capture_rate', 'grid_utilization', 'cycles']
-            ].copy()
+            # Kostenparameter aus Session State holen
+            c_E = st.session_state.get('cost_energy', 165)  # €/kWh
+            c_P = st.session_state.get('cost_power', 170)   # €/kW
+            p_nvp = st.session_state.get('p_nvp_mw', 50)    # MW
             
-            top5.columns = ['Leistung (MW)', 'Kapazität (MWh)', 'Dauer (h)', 
-                           'Erfassungsgrad', 'Netzauslastung', 'Zyklen/Jahr']
-            top5['Erfassungsgrad'] = top5['Erfassungsgrad'].apply(lambda x: f'{x*100:.1f}%')
-            top5['Netzauslastung'] = top5['Netzauslastung'].apply(lambda x: f'{x*100:.1f}%')
-            top5['Zyklen/Jahr'] = top5['Zyklen/Jahr'].apply(lambda x: f'{x:.0f}')
+            render_parameterstudy_advanced_plots(results, c_E, c_P, p_nvp)
             
-            st.dataframe(top5, use_container_width=True, hide_index=True)
+            st.markdown("---")
+            
+            # Wirtschaftlichkeitsbewertung
+            render_economic_evaluation_plot(
+                results, 
+                electricity_price=electricity_price,
+                project_lifetime=project_lifetime_ps,
+                discount_rate=discount_rate_ps
+            )
+            
+            st.markdown("---")
+            
+            # Tabelle mit besten Konfigurationen (erweitert um wirtschaftliche Kennzahlen)
+            st.markdown("#### 🏆 Top 5 Konfigurationen")
+            
+            # Tabs für verschiedene Sortierungen
+            tab1, tab2 = st.tabs(["Nach Erfassungsgrad", "Nach NPV"])
+            
+            with tab1:
+                top5_eta = results.nlargest(5, 'capture_rate')[
+                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h', 
+                     'capture_rate', 'npv', 'break_even_price', 'cycles']
+                ].copy()
+                
+                top5_eta.columns = ['P (MW)', 'E (MWh)', 'E/P (h)', 
+                               'Erfassung', 'NPV (€)', 'Break-Even (€/MWh)', 'Zyklen']
+                top5_eta['Erfassung'] = top5_eta['Erfassung'].apply(lambda x: f'{x*100:.1f}%')
+                top5_eta['NPV (€)'] = top5_eta['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.' if x > -1e9 else '—')
+                top5_eta['Break-Even (€/MWh)'] = top5_eta['Break-Even (€/MWh)'].apply(lambda x: f'{x:.0f}' if x < 500 else '> 500')
+                top5_eta['Zyklen'] = top5_eta['Zyklen'].apply(lambda x: f'{x:.0f}')
+                
+                st.dataframe(top5_eta, use_container_width=True, hide_index=True)
+            
+            with tab2:
+                top5_npv = results.nlargest(5, 'npv')[
+                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h', 
+                     'capture_rate', 'npv', 'payback_years', 'break_even_price']
+                ].copy()
+                
+                top5_npv.columns = ['P (MW)', 'E (MWh)', 'E/P (h)', 
+                               'Erfassung', 'NPV (€)', 'Amortisation (a)', 'Break-Even (€/MWh)']
+                top5_npv['Erfassung'] = top5_npv['Erfassung'].apply(lambda x: f'{x*100:.1f}%')
+                top5_npv['NPV (€)'] = top5_npv['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.' if x > -1e9 else '—')
+                top5_npv['Amortisation (a)'] = top5_npv['Amortisation (a)'].apply(lambda x: f'{x:.1f}' if x < 100 else '> 100')
+                top5_npv['Break-Even (€/MWh)'] = top5_npv['Break-Even (€/MWh)'].apply(lambda x: f'{x:.0f}' if x < 500 else '> 500')
+                
+                st.dataframe(top5_npv, use_container_width=True, hide_index=True)
+            
+            # Wirtschaftliche Parameter speichern für Step 5
+            st.session_state.economic_params_ps = {
+                'electricity_price': electricity_price,
+                'project_lifetime': project_lifetime_ps,
+                'discount_rate': discount_rate_ps,
+                'opex_rate': opex_rate_ps,
+                'use_da_prices': use_da_prices_for_revenue,
+                'c_E': c_E,
+                'c_P': c_P,
+            }
     
     st.markdown("---")
     
@@ -5660,79 +6605,245 @@ def show_mode_c_step5():
     st.markdown("---")
     
     # Beispielwoche visualisieren
-    st.markdown("#### 📊 Beispielwoche mit Speicherbetrieb")
+    st.markdown("#### 📊 Zeitreihen-Visualisierung")
     
     # Zeitauflösung
     time_res_c = st.session_state.get('time_resolution_c', detect_time_resolution(len(sim['p_ee'])))
     steps_per_day_c = time_res_c['steps_per_day']
     dt_c = time_res_c['dt']
+    n_total = len(sim['p_ee'])
+    n_days_total = n_total // steps_per_day_c
     
-    days_to_show = st.slider("Anzeigetage", 1, 14, 7, key="days_c5")
-    end_idx = min(days_to_show * steps_per_day_c, len(sim['p_ee']))
+    # Ansichtsmodus auswählen
+    view_mode_ps = st.radio(
+        "Ansicht wählen:",
+        ["Ganzes Jahr (tatsächliche Werte)", "Detailansicht (Woche)"],
+        horizontal=True,
+        key="view_mode_parameterstudy"
+    )
     
-    fig, axes = plt.subplots(4 if da_prices is not None else 3, 1, figsize=(14, 12 if da_prices is not None else 10), sharex=True)
+    p_nvp = st.session_state.p_nvp_mw
     
-    if da_prices is not None:
-        ax1, ax2, ax3, ax4 = axes
-    else:
-        ax1, ax2, ax3 = axes
-    
-    x = range(end_idx)
-    
-    # Erzeugung und Netzeinspeisung
-    ax1.fill_between(x, sim['p_ee'][:end_idx], alpha=0.3, label='Erzeugung', color='#3498db')
-    ax1.plot(x, sim['p_grid'][:end_idx], label='Netzeinspeisung', color='#2ecc71', linewidth=1.5)
-    ax1.axhline(y=st.session_state.p_nvp_mw, color='red', linestyle='--', label='NVP-Kapazität')
-    ax1.set_ylabel('Leistung (MW)')
-    ax1.set_title('Erzeugung und Netzeinspeisung')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Speicherleistung
-    ax2.fill_between(x, sim['p_charge'][:end_idx], alpha=0.5, label='Laden', color='#e74c3c')
-    ax2.fill_between(x, -sim['p_discharge'][:end_idx], alpha=0.5, label='Entladen', color='#2ecc71')
-    ax2.axhline(y=0, color='black', linewidth=0.5)
-    ax2.set_ylabel('Speicherleistung (MW)')
-    ax2.set_title('Speicherbetrieb')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    # Ladezustand
-    soc_percent = sim['soc'][:end_idx] / optimal['storage_capacity_mwh'] * 100
-    ax3.fill_between(x, soc_percent, alpha=0.5, color='#9b59b6')
-    ax3.plot(x, soc_percent, color='#9b59b6', linewidth=1)
-    ax3.set_ylabel('Ladezustand (%)')
-    ax3.set_title('Speicher-Ladezustand')
-    ax3.set_ylim(0, 100)
-    ax3.grid(True, alpha=0.3)
-    
-    # Preisplot hinzufügen wenn Preise vorhanden
-    if da_prices is not None:
-        prices_plot = sim['prices'][:end_idx] if sim['prices'] is not None else da_prices.values[:end_idx]
-        ax4.plot(x, prices_plot, color='#f39c12', linewidth=1, label='Day-Ahead-Preis')
+    if view_mode_ps == "Ganzes Jahr (tatsächliche Werte)":
+        # =====================================================================
+        # JAHRESANSICHT MIT TATSÄCHLICHEN WERTEN
+        # =====================================================================
+        st.info("📅 Darstellung: Tatsächliche Zeitreihen über das gesamte Jahr (keine Mittelwerte)")
         
-        # Schwellwert anzeigen
-        if discharge_strategy == "price_threshold" and price_threshold is not None:
-            ax4.axhline(y=price_threshold, color='#e74c3c', linestyle='--', 
-                       label=f'Schwellwert ({price_threshold:.0f} €/MWh)')
+        # Zeitachse für das ganze Jahr (in Tagen)
+        x_days = np.arange(n_total) / steps_per_day_c
         
-        # Entladezeitpunkte markieren
-        discharge_mask = sim['p_discharge'][:end_idx] > 0
-        if discharge_mask.any():
-            ax4.fill_between(x, 0, prices_plot, where=discharge_mask, 
-                           alpha=0.3, color='#2ecc71', label='Entladung')
+        # Überschuss berechnen
+        p_surplus = np.maximum(sim['p_ee'] - p_nvp, 0)
         
-        ax4.set_ylabel('Preis (€/MWh)')
-        ax4.set_xlabel('Zeitschritt (15 min)')
-        ax4.set_title('Day-Ahead-Preise und Entladezeitpunkte')
-        ax4.legend()
+        # Anzahl Subplots je nach Preisdaten
+        n_subplots = 5 if da_prices is not None else 4
+        fig, axes = plt.subplots(n_subplots, 1, figsize=(14, 3.5 * n_subplots), sharex=True)
+        
+        months = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez']
+        month_starts = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        
+        # 1. Erzeugung und Netzeinspeisung
+        ax1 = axes[0]
+        ax1.fill_between(x_days, sim['p_ee'], alpha=0.4, label='Erzeugung', color='#3498db')
+        ax1.plot(x_days, sim['p_grid'], label='Netzeinspeisung', color='#2ecc71', linewidth=0.3, alpha=0.9)
+        ax1.axhline(y=p_nvp, color='red', linestyle='--', linewidth=2, label=f'NVP ({p_nvp:.0f} MW)')
+        ax1.set_ylabel('Leistung (MW)')
+        ax1.set_title('Erzeugung und Netzeinspeisung')
+        ax1.legend(loc='upper right', fontsize=9)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim(0, max(sim['p_ee'].max() * 1.1, p_nvp * 1.2))
+        
+        # 2. Überschuss und Abregelung
+        ax2 = axes[1]
+        ax2.fill_between(x_days, p_surplus, alpha=0.5, label='Überschuss (über NVP)', color='#f39c12')
+        ax2.fill_between(x_days, sim['p_curtail'], alpha=0.8, label='Abregelung (mit Speicher)', color='#c0392b')
+        ax2.set_ylabel('Leistung (MW)')
+        total_surplus_mwh = p_surplus.sum() * dt_c
+        total_curtail_mwh = sim['total_curtailment_mwh']
+        captured_pct = (1 - total_curtail_mwh / total_surplus_mwh) * 100 if total_surplus_mwh > 0 else 0
+        ax2.set_title(f'Überschuss: {total_surplus_mwh:,.0f} MWh → Abregelung: {total_curtail_mwh:,.0f} MWh (Erfassung: {captured_pct:.0f}%)')
+        ax2.legend(loc='upper right', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Speicherleistung (Laden/Entladen)
+        ax3 = axes[2]
+        ax3.fill_between(x_days, sim['p_charge'], alpha=0.7, label='Laden', color='#e74c3c')
+        ax3.fill_between(x_days, -sim['p_discharge'], alpha=0.7, label='Entladen', color='#2ecc71')
+        ax3.axhline(y=0, color='black', linewidth=0.5)
+        ax3.set_ylabel('Leistung (MW)')
+        total_charged = sim['p_charge'].sum() * dt_c
+        total_discharged = sim['p_discharge'].sum() * dt_c
+        cycles = total_discharged / optimal['storage_capacity_mwh'] if optimal['storage_capacity_mwh'] > 0 else 0
+        ax3.set_title(f'Speicherbetrieb (Geladen: {total_charged:,.0f} MWh, Entladen: {total_discharged:,.0f} MWh, Zyklen: {cycles:.0f})')
+        ax3.legend(loc='upper right', fontsize=9)
+        ax3.grid(True, alpha=0.3)
+        
+        # 4. SOC (Ladezustand)
+        ax4 = axes[3]
+        total_capacity = optimal['storage_capacity_mwh']
+        soc_data = sim['soc'][:n_total]
+        
+        ax4.fill_between(x_days[:len(soc_data)], soc_data, alpha=0.5, color='#9b59b6')
+        ax4.plot(x_days[:len(soc_data)], soc_data, color='#9b59b6', linewidth=0.3)
+        ax4.axhline(y=total_capacity, color='#e74c3c', linestyle=':', linewidth=2, 
+                   label=f'Kapazität ({total_capacity:.1f} MWh)')
+        ax4.set_ylabel('SOC (MWh)')
+        ax4.set_title('Speicherfüllstand')
+        ax4.set_ylim(0, total_capacity * 1.15 if total_capacity > 0 else 10)
+        ax4.legend(loc='upper right', fontsize=9)
         ax4.grid(True, alpha=0.3)
-    else:
-        ax3.set_xlabel('Zeitschritt (15 min)')
+        
+        # 5. Preise (falls vorhanden)
+        if da_prices is not None:
+            ax5 = axes[4]
+            prices_year = sim['prices'][:n_total] if sim['prices'] is not None else da_prices.values[:n_total]
+            ax5.plot(x_days[:len(prices_year)], prices_year, color='#f39c12', linewidth=0.3, alpha=0.8)
+            ax5.set_ylabel('Preis (€/MWh)')
+            ax5.set_xlabel('Tag des Jahres')
+            avg_price = np.mean(prices_year)
+            ax5.axhline(y=avg_price, color='#e67e22', linestyle='--', linewidth=1, 
+                       label=f'Jahresmittel ({avg_price:.1f} €/MWh)')
+            ax5.set_title('Day-Ahead-Strompreise')
+            ax5.legend(loc='upper right', fontsize=9)
+            ax5.grid(True, alpha=0.3)
+            
+            # X-Achse für letzten Plot
+            ax5.set_xticks(month_starts)
+            ax5.set_xticklabels(months)
+            ax5.set_xlim(0, 365)
+        else:
+            # X-Achse für letzten Plot (SOC)
+            ax4.set_xlabel('Tag des Jahres')
+            ax4.set_xticks(month_starts)
+            ax4.set_xticklabels(months)
+            ax4.set_xlim(0, 365)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        
+        # Monatliche Statistik als Tabelle
+        with st.expander("📊 Monatliche Statistik"):
+            month_ends = month_starts[1:] + [365]
+            monthly_stats = []
+            
+            for i, (m_start, m_end) in enumerate(zip(month_starts, month_ends)):
+                idx_start = m_start * steps_per_day_c
+                idx_end = min(m_end * steps_per_day_c, n_total)
+                
+                if idx_end > idx_start:
+                    monthly_stats.append({
+                        'Monat': months[i],
+                        'Erzeugung (MWh)': sim['p_ee'][idx_start:idx_end].sum() * dt_c,
+                        'Einspeisung (MWh)': sim['p_grid'][idx_start:idx_end].sum() * dt_c,
+                        'Überschuss (MWh)': p_surplus[idx_start:idx_end].sum() * dt_c,
+                        'Abregelung (MWh)': sim['p_curtail'][idx_start:idx_end].sum() * dt_c,
+                        'Geladen (MWh)': sim['p_charge'][idx_start:idx_end].sum() * dt_c,
+                        'Entladen (MWh)': sim['p_discharge'][idx_start:idx_end].sum() * dt_c,
+                    })
+            
+            monthly_df = pd.DataFrame(monthly_stats)
+            # Formatieren
+            for col in monthly_df.columns[1:]:
+                monthly_df[col] = monthly_df[col].apply(lambda x: f'{x:,.0f}')
+            st.dataframe(monthly_df, use_container_width=True, hide_index=True)
     
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close()
+    else:
+        # =====================================================================
+        # DETAILANSICHT (WOCHE)
+        # =====================================================================
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            start_day = st.slider(
+                "Starttag im Jahr",
+                min_value=1,
+                max_value=max(1, n_days_total - 7),
+                value=150,  # Default: ca. Juni
+                key="start_day_ps",
+                help="Tag 1 = 1. Januar"
+            )
+        
+        with col2:
+            days_to_show = st.selectbox(
+                "Anzeigetage",
+                [3, 7, 14, 21],
+                index=1,
+                key="days_c5"
+            )
+        
+        start_idx = (start_day - 1) * steps_per_day_c
+        end_idx = min(start_idx + days_to_show * steps_per_day_c, n_total)
+        
+        # Monat für Titel
+        month_names = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 
+                      'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember']
+        approx_month = min(11, (start_day - 1) // 30)
+        st.caption(f"📅 Angezeigt: Tag {start_day} - {start_day + days_to_show - 1} (ca. {month_names[approx_month]})")
+        
+        n_subplots = 4 if da_prices is not None else 3
+        fig, axes = plt.subplots(n_subplots, 1, figsize=(14, 3 * n_subplots), sharex=True)
+        
+        if da_prices is not None:
+            ax1, ax2, ax3, ax4 = axes
+        else:
+            ax1, ax2, ax3 = axes
+        
+        x = range(end_idx - start_idx)
+        
+        # Erzeugung und Netzeinspeisung
+        ax1.fill_between(x, sim['p_ee'][start_idx:end_idx], alpha=0.3, label='Erzeugung', color='#3498db')
+        ax1.plot(x, sim['p_grid'][start_idx:end_idx], label='Netzeinspeisung', color='#2ecc71', linewidth=1.5)
+        ax1.axhline(y=p_nvp, color='red', linestyle='--', label='NVP-Kapazität')
+        ax1.set_ylabel('Leistung (MW)')
+        ax1.set_title('Erzeugung und Netzeinspeisung')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Speicherleistung
+        ax2.fill_between(x, sim['p_charge'][start_idx:end_idx], alpha=0.5, label='Laden', color='#e74c3c')
+        ax2.fill_between(x, -sim['p_discharge'][start_idx:end_idx], alpha=0.5, label='Entladen', color='#2ecc71')
+        ax2.axhline(y=0, color='black', linewidth=0.5)
+        ax2.set_ylabel('Speicherleistung (MW)')
+        ax2.set_title('Speicherbetrieb')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Ladezustand
+        soc_percent = sim['soc'][start_idx:end_idx] / optimal['storage_capacity_mwh'] * 100
+        ax3.fill_between(x, soc_percent, alpha=0.5, color='#9b59b6')
+        ax3.plot(x, soc_percent, color='#9b59b6', linewidth=1)
+        ax3.set_ylabel('Ladezustand (%)')
+        ax3.set_title('Speicher-Ladezustand')
+        ax3.set_ylim(0, 100)
+        ax3.grid(True, alpha=0.3)
+        
+        # Preisplot hinzufügen wenn Preise vorhanden
+        if da_prices is not None:
+            prices_plot = sim['prices'][start_idx:end_idx] if sim['prices'] is not None else da_prices.values[start_idx:end_idx]
+            ax4.plot(x, prices_plot, color='#f39c12', linewidth=1, label='Day-Ahead-Preis')
+            
+            if discharge_strategy == "price_threshold" and price_threshold is not None:
+                ax4.axhline(y=price_threshold, color='#e74c3c', linestyle='--', 
+                           label=f'Schwellwert ({price_threshold:.0f} €/MWh)')
+            
+            discharge_mask = sim['p_discharge'][start_idx:end_idx] > 0
+            if discharge_mask.any():
+                ax4.fill_between(x, 0, prices_plot, where=discharge_mask, 
+                               alpha=0.3, color='#2ecc71', label='Entladung')
+            
+            ax4.set_ylabel('Preis (€/MWh)')
+            ax4.set_xlabel(f'Zeitschritt ({time_res_c["resolution"]})')
+            ax4.set_title('Day-Ahead-Preise und Entladezeitpunkte')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax3.set_xlabel(f'Zeitschritt ({time_res_c["resolution"]})')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
     
     st.markdown("---")
     
