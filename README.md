@@ -1,4 +1,4 @@
-# 🔋 Batteriespeicher-Optimierungstool
+# Batteriespeicher-Optimierungstool
 
 **Entwicklung eines Python-basierten Tools zur Bestimmung optimaler Betriebsstrategien und Dimensionierung von Großbatteriespeichern**
 
@@ -6,7 +6,7 @@ Bachelorarbeit an der TH Köln - Fakultät für Anlagen, Energie- und Maschinens
 
 ---
 
-## 🎯 Funktionen
+## Funktionen
 
 Das Tool bietet drei Analysemodi für verschiedene Anwendungsfälle:
 
@@ -18,7 +18,7 @@ Das Tool bietet drei Analysemodi für verschiedene Anwendungsfälle:
 
 ---
 
-## 📋 Changelog v3.1 (Januar 2026)
+## Changelog v3.1 (Januar 2026)
 
 ### NEU: Erweiterte Export- und Analysefunktionen
 
@@ -66,13 +66,13 @@ Das Tool erkennt nun automatisch die Zeitauflösung der hochgeladenen Profile:
 
 ---
 
-## 🚀 Live-Demo
+## Live-Demo
 
-**[➡️ App auf Streamlit Cloud öffnen](https://batteriespeicher-tool.streamlit.app)**
+**[App auf Streamlit Cloud öffnen](https://batteriespeicher-tool.streamlit.app)**
 
 ---
 
-## 💻 Lokale Installation
+## Lokale Installation
 
 ### Voraussetzungen
 - Python 3.9 oder höher
@@ -82,7 +82,7 @@ Das Tool erkennt nun automatisch die Zeitauflösung der hochgeladenen Profile:
 
 ```bash
 # Repository klonen
-git clone https://github.com/DEIN-USERNAME/batteriespeicher-tool.git
+git clone https://github.com/oliveiralimaluizaugusto-tech/batteriespeicher-tool.git
 cd batteriespeicher-tool
 
 # Abhängigkeiten installieren
@@ -96,7 +96,7 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 
 ---
 
-## 📊 Benötigte Eingabedaten
+## Benötigte Eingabedaten
 
 ### Modus A - Wirtschaftlichkeit
 - Optional: Day-Ahead-Preisprofil (CSV)
@@ -115,7 +115,7 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 
 ---
 
-## 🔧 Technische Details
+## Technische Details
 
 ### Optimierung
 - **Framework:** PyPSA (Python for Power System Analysis)
@@ -130,7 +130,7 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 
 ---
 
-## 📁 Projektstruktur
+## Projektstruktur
 
 ```
 batteriespeicher-tool/
@@ -148,7 +148,7 @@ batteriespeicher-tool/
 
 ---
 
-## 📚 Referenzen
+## Referenzen
 
 - [PyPSA Dokumentation](https://pypsa.readthedocs.io/)
 - [Streamlit Dokumentation](https://docs.streamlit.io/)
@@ -158,7 +158,7 @@ batteriespeicher-tool/
 
 ---
 
-## 👤 Autor
+## Autor
 
 **Luiz Lima**  
 TH Köln - Fakultät für Anlagen, Energie- und Maschinensysteme  
