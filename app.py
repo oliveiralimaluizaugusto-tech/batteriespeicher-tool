@@ -1765,7 +1765,7 @@ def show_mode_a_step2():
             revenue_arbitrage = st.number_input(
                 "Arbitrage-Erlös (€/MWh/Jahr)",
                 min_value=10000,
-                max_value=80000,
+                max_value=200000,
                 value=35000,
                 step=2500,
                 help="Typisch 2024: 25.000-50.000 €/MWh/Jahr bei 1.5-2 Zyklen/Tag und 50-80 €/MWh Spread"
