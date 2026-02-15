@@ -1757,7 +1757,7 @@ def show_mode_a_step2():
                 max_value=150000,
                 value=70000,
                 step=5000,
-                help="Typisch: 50.000-90.000 €/MW/Jahr (Leistungspreis + Arbeitspreis)"
+                help="Typisch: 90.000-140.000 €/MW/Jahr (Leistungspreis + Arbeitspreis)"
             )
             
             st.markdown("##### 💹 Arbitrage (Day-Ahead + Intraday)")
@@ -1768,7 +1768,7 @@ def show_mode_a_step2():
                 max_value=200000,
                 value=35000,
                 step=2500,
-                help="Typisch 2024: 25.000-50.000 €/MWh/Jahr bei 1.5-2 Zyklen/Tag und 50-80 €/MWh Spread"
+                help="Typisch 2024: 80.000-150.000 €/MWh/Jahr bei 1.5-2 Zyklen/Tag und 50-80 €/MWh Spread"
             )
             
             st.markdown("""
