@@ -1774,7 +1774,7 @@ def show_mode_a_step2():
             st.markdown("""
             <div class="warning-box">
                 <strong>💡 Tipp:</strong> Bei hoher Preisvolatilität (wie 2022/2023) können 
-                Arbitrage-Erlöse deutlich höher sein (bis 80.000 €/MWh/Jahr).
+                Arbitrage-Erlöse deutlich höher sein (bis 140.000 €/MWh/Jahr).
             </div>
             """, unsafe_allow_html=True)
         
