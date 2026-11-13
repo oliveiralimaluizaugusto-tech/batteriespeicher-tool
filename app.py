@@ -5627,7 +5627,8 @@ def keep_widget_state():
     for key in list(st.session_state.keys()):
         if not isinstance(key, str):
             continue
-        if "upload" in key or key.endswith("_btn") or key.startswith("dl_"):
+        if ("upload" in key or key.endswith("_btn") or key.startswith("dl_")
+                or key in ("mode_a", "mode_b", "mode_c")):
             continue
         st.session_state[key] = st.session_state[key]
 
