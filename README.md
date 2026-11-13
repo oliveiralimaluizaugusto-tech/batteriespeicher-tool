@@ -18,55 +18,7 @@ Das Tool bietet drei Analysemodi für verschiedene Anwendungsfälle:
 
 ---
 
-## Changelog v3.1 (Januar 2026)
 
-### NEU: Erweiterte Export- und Analysefunktionen
-
-**1. CSV-Export der Parameterstudie (Rohdaten)**
-- Vollständige Rohdaten statt nur Heatmap
-- Spalten: run_id, scenario, nvp_mw, wind_mw, pv_mw, E_MWh, P_MW, EP_h, eta_roundtrip, soc_min, soc_max, curtailment_without_MWh, curtailment_with_MWh, capture_rate, cycles_estimate, etc.
-- Export nach `/exports/parameter_study_results.csv`
-
-**2. Zeitreihen-Export (15-min oder stündlich)**
-- Automatische Erkennung der Zeitauflösung
-- Spalten: timestamp, wind_MW, pv_MW, generation_total_MW, nvp_export_MW, curtailment_MW, battery_charge_MW, battery_discharge_MW, soc_MWh, soc_pu
-- Export nach `/exports/timeseries_run_<id>.csv`
-
-**3. Überschuss-Histogramm mit Leistungsklassen**
-- Zeigt "Anzahl Stunden pro Leistungsintervall"
-- Adaptive Binbreite (max_surplus/20, min 1 MW) oder benutzerdefiniert
-- Export als CSV und PNG
-
-**4. Saisonale Auswertung (Winter/Sommer)**
-- Definition für Deutschland: Winter (Nov-Feb), Sommer (Mai-Aug), Übergang (Mär-Apr, Sep-Okt)
-- Kennzahlen: surplus_energy_MWh, curtailment_energy_MWh, hours_surplus, max_surplus_MW, p95_surplus_MW, capture_rate_season
-
-### Automatische Zeitauflösungserkennung
-
-Das Tool erkennt nun automatisch die Zeitauflösung der hochgeladenen Profile:
-- **35.040 Datenpunkte** → 15-Minuten-Auflösung
-- **8.760 Datenpunkte** → Stündliche Auflösung
-
-### Modus A - Verbesserte Wirtschaftlichkeitsrechnung
-
-**Realistische Erlösberechnung:**
-- FCR-Erlös Default erhöht auf 160.000 €/MW/Jahr (vorher: 120.000)
-- aFRR-Erlös Default erhöht auf 70.000 €/MW/Jahr (vorher: 50.000)
-- Arbitrage-Erlös Default erhöht auf 35.000 €/MWh/Jahr (vorher: 15.000)
-
-**Verbesserte Arbitrage-Berechnung:**
-- 1.5-2 Zyklen pro Tag statt max. 1
-- Intraday-Aufschlag von 35% berücksichtigt
-- Default-Spread von 65 €/MWh (vorher: 30 €/MWh)
-
-**Neue Visualisierung:**
-- Erlösaufteilung als Tortendiagramm
-- Detaillierte Erlöstabelle mit Brutto/Netto
-- Marktvergleich (konservativ/durchschnitt/optimistisch)
-
----
-
-## Live-Demo
 
 **[App auf Streamlit Cloud öffnen](https://batteriespeicher-tool.streamlit.app)**
 
@@ -128,13 +80,32 @@ Die App öffnet sich automatisch unter `http://localhost:8501`
 - Konfigurierbare Zinssätze und Lebensdauern
 - NPV, IRR, Amortisationszeit, LCOS
 
+### Modellannahmen (`speicher_modell.py`)
+- **Einheitliche Zielfunktion in €/Jahr:** Investition als Annuität + OPEX, Betriebskosten und
+  Erlöse mit der tatsächlichen Zeitschrittlänge gewichtet (15-min- und Stundendaten liefern
+  dasselbe Ergebnis). Zeitreihen, die kein volles Jahr abdecken, werden linear hochgerechnet.
+- **Ein Wechselrichter:** Lade- und Entladeleistung sind gekoppelt (AC-seitige Nennleistung).
+- **SOC-Grenzen:** Kosten beziehen sich auf die Nennkapazität, nutzbar ist `soc_max − soc_min`.
+- **Zyklischer Speicher:** Endfüllstand = Anfangsfüllstand (keine geschenkte Anfangsenergie).
+- **Modus A:** Arbitrage als optimaler Fahrplan gegen die Preiszeitreihe (perfekte Voraussicht,
+  obere Schranke), optional mit Zyklenlimit. FCR/aFRR/Arbitrage teilen sich Leistung und Kapazität.
+- **Modus B:** Zielgrenze als harte Nebenbedingung (kostenminimaler Speicher) oder
+  wirtschaftliches Optimum mit der Jahresspitze als Variable (Leistungspreis in der Zielfunktion).
+  Verlustenergie wird mit dem Arbeitspreis bewertet.
+- **Modus C:** Der Speicher lädt nur aus eigener Erzeugung (kein Netzbezug). Bewertet wird der
+  Mehrerlös gegenüber dem Betrieb ohne Speicher – also die tatsächlich zusätzlich eingespeiste
+  Energie nach Verlusten.
+- **Nicht modelliert:** Degradation/Ersatzinvestitionen, Netzentgelte und Umlagen, Steuern,
+  Prognosefehler. Ergebnisse sind Auslegungsrechnungen, keine Erlösprognosen.
+
 ---
 
 ## Projektstruktur
 
 ```
 batteriespeicher-tool/
-├── app.py                # Hauptanwendung (Streamlit)
+├── app.py                # Hauptanwendung (Streamlit-Oberfläche)
+├── speicher_modell.py    # Rechenmodelle (PyPSA), ohne Streamlit – separat testbar
 ├── export_analytics.py   # Export- und Analysemodul
 ├── requirements.txt      # Python-Abhängigkeiten
 ├── exports/              # Exportierte Dateien (automatisch erstellt)

@@ -31,8 +31,8 @@ import matplotlib.dates as mdates
 from matplotlib.ticker import MaxNLocator
 from matplotlib.colors import BoundaryNorm
 
-# PyPSA für Optimierung
-import pypsa
+# Rechenmodelle (PyPSA-Optimierung, ohne Streamlit-Abhängigkeit)
+import speicher_modell as sm
 
 # Export und Analyse-Modul
 try:
@@ -70,9 +70,7 @@ def calculate_annuity_factor(rate, years):
     Returns:
         Annuitätenfaktor
     """
-    if rate == 0 or rate is None:
-        return 1 / years if years > 0 else 1
-    return (rate * (1 + rate) ** years) / ((1 + rate) ** years - 1)
+    return sm.annuity_factor(rate, years)
 
 
 def calculate_capex_components(system_price_kwh, reference_duration_h=2.0, 
@@ -178,10 +176,10 @@ def render_capex_input_widget(prefix, default_system_price=250, default_duration
         with col1:
             system_price = st.number_input(
                 "Systempreis (€/kWh)",
-                min_value=50,
-                max_value=1000,
-                value=default_system_price,
-                step=10,
+                min_value=50.0,
+                max_value=1000.0,
+                value=float(default_system_price),
+                step=10.0,
                 key=f"{prefix}_system_price",
                 help="Gesamtkosten pro kWh installierter Speicherkapazität (inkl. Wechselrichter, BOS)"
             )
@@ -191,7 +189,7 @@ def render_capex_input_widget(prefix, default_system_price=250, default_duration
                 "Referenzdauer (h)",
                 min_value=0.5,
                 max_value=8.0,
-                value=default_duration,
+                value=float(min(max(round(default_duration * 2) / 2, 0.5), 8.0)),
                 step=0.5,
                 key=f"{prefix}_ref_duration",
                 help="E/P-Verhältnis, auf das sich der Systempreis bezieht (typisch: 2h oder 4h)"
@@ -223,22 +221,22 @@ def render_capex_input_widget(prefix, default_system_price=250, default_duration
         with col1:
             c_E = st.number_input(
                 "Energiekosten (€/kWh)",
-                min_value=50,
-                max_value=500,
-                value=165,
-                step=5,
-                key=f"{prefix}_c_E",
+                min_value=20.0,
+                max_value=500.0,
+                value=165.0,
+                step=5.0,
+                key=f"{prefix}_c_E_input",
                 help="Kosten pro kWh: Batteriezellen, BMS, Gehäuse, Thermomanagement"
             )
         
         with col2:
             c_P = st.number_input(
                 "Leistungskosten (€/kW)",
-                min_value=0,
-                max_value=500,
-                value=170,
-                step=5,
-                key=f"{prefix}_c_P",
+                min_value=0.0,
+                max_value=500.0,
+                value=170.0,
+                step=5.0,
+                key=f"{prefix}_c_P_input",
                 help="Kosten pro kW: Wechselrichter, Transformator, Netzanschluss"
             )
         
@@ -483,15 +481,35 @@ def load_csv_file(uploaded_file, expected_columns=None):
         df.columns = df.columns.str.strip()
         
         # Erste Spalte als Zeitstempel interpretieren
-        first_col = df.columns[0]
-        df[first_col] = parse_datetime_column(df[first_col])
-        
-        if df[first_col] is not None and not df[first_col].isna().all():
-            df.set_index(first_col, inplace=True)
+        if df.shape[1] >= 2:
+            first_col = df.columns[0]
+            df[first_col] = parse_datetime_column(df[first_col])
+
+            if df[first_col] is not None and not df[first_col].isna().all():
+                df.set_index(first_col, inplace=True)
         
         # Werte-Spalten bereinigen (Währungssymbole entfernen, in Zahlen konvertieren)
         for col in df.columns:
             df[col] = clean_numeric_column(df[col])
+        
+        # Komplett leere Spalten/Zeilen entfernen, Lücken in der Wertespalte füllen.
+        # NaN-Werte würden die Optimierung sonst unlösbar machen.
+        df = df.dropna(axis=1, how='all')
+        if df.shape[1] == 0:
+            st.error("❌ Die Datei enthält keine numerische Wertespalte.")
+            return None
+        # Nur leere Zeilen am Dateiende abschneiden. Lücken mitten in der Reihe
+        # bleiben als Zeitschritt erhalten (sonst verschiebt sich die Zeitreihe).
+        last_valid = df.iloc[:, 0].notna().values.nonzero()[0]
+        if len(last_valid) == 0:
+            st.error("❌ Die Wertespalte enthält keine lesbaren Zahlen.")
+            return None
+        df = df.iloc[:last_valid[-1] + 1].copy()
+        n_missing = int(df.iloc[:, 0].isna().sum())
+        if n_missing > 0:
+            df.iloc[:, 0] = df.iloc[:, 0].interpolate(limit_direction='both')
+            st.warning(f"⚠️ {n_missing} fehlende/nicht lesbare Werte in der Datenspalte "
+                       "wurden linear interpoliert. Bitte Datei prüfen.")
         
         return df
     
@@ -504,85 +522,58 @@ def load_csv_file(uploaded_file, expected_columns=None):
 
 def detect_time_resolution(data, index=None):
     """
-    Erkennt automatisch die Zeitauflösung eines Datensatzes.
-    
-    Methoden:
-    1. Anzahl der Datenpunkte (35040 = 15-min, 8760 = stündlich)
-    2. Zeitdifferenz zwischen Datenpunkten (falls Index vorhanden)
-    
+    Erkennt die Zeitauflösung eines Datensatzes.
+
+    Reihenfolge:
+    1. Zeitstempel-Index (Median der Zeitdifferenzen) – zuverlässig, auch wenn
+       die Datei kein volles Jahr enthält.
+    2. Anzahl der Datenpunkte (35.040 = 15-min, 8.760 = stündlich).
+    3. Schätzung (> 10.000 Punkte -> 15-min, sonst stündlich) mit Hinweis.
+
     Args:
-        data: DataFrame, Series oder Array mit Zeitreihendaten
+        data: DataFrame, Series, Array oder Anzahl der Datenpunkte
         index: Optional - DatetimeIndex für präzise Erkennung
-    
+
     Returns:
-        dict mit:
-        - 'dt': Zeitschritt in Stunden (0.25 für 15-min, 1.0 für stündlich)
-        - 'resolution': String-Beschreibung ('15-Minuten' oder 'Stündlich')
-        - 'steps_per_day': Schritte pro Tag (96 oder 24)
-        - 'steps_per_year': Erwartete Schritte pro Jahr
+        dict mit 'dt' (Stunden je Zeitschritt), 'resolution' (Beschreibung),
+        'steps_per_day', 'steps_per_year' und 'estimated' (True = geraten)
     """
-    # Anzahl der Datenpunkte ermitteln
-    if hasattr(data, '__len__'):
-        n = len(data)
-    else:
-        n = data
-    
-    # Methode 1: Basierend auf Datenpunktanzahl
-    # 15-Minuten: 35040 (365 * 96), 35136 (366 * 96)
-    # Stündlich: 8760 (365 * 24), 8784 (366 * 24)
-    
-    if n >= 34000 and n <= 36000:
-        # 15-Minuten-Auflösung
-        dt = 0.25
-        resolution = "15-Minuten"
-        steps_per_day = 96
-    elif n >= 8700 and n <= 8800:
-        # Stündliche Auflösung
-        dt = 1.0
-        resolution = "Stündlich"
-        steps_per_day = 24
-    else:
-        # Methode 2: Falls Index vorhanden, Zeitdifferenz berechnen
-        if index is not None and hasattr(index, 'to_series'):
-            try:
-                time_diff = index.to_series().diff().median()
-                minutes = time_diff.total_seconds() / 60
-                
-                if minutes <= 20:  # ~15 Minuten
-                    dt = 0.25
-                    resolution = "15-Minuten"
-                    steps_per_day = 96
-                elif minutes <= 70:  # ~60 Minuten
-                    dt = 1.0
-                    resolution = "Stündlich"
-                    steps_per_day = 24
-                else:
-                    # Unbekannte Auflösung - Default 15-min
-                    dt = 0.25
-                    resolution = f"Unbekannt ({minutes:.0f} min) - verwende 15-min"
-                    steps_per_day = 96
-            except:
-                # Fallback
-                dt = 0.25
-                resolution = "15-Minuten (Standard)"
-                steps_per_day = 96
-        else:
-            # Heuristik: Wenn n > 10000 -> 15-min, sonst stündlich
-            if n > 10000:
-                dt = 0.25
-                resolution = "15-Minuten (geschätzt)"
-                steps_per_day = 96
-            else:
-                dt = 1.0
-                resolution = "Stündlich (geschätzt)"
-                steps_per_day = 24
-    
-    return {
-        'dt': dt,
-        'resolution': resolution,
-        'steps_per_day': steps_per_day,
-        'steps_per_year': steps_per_day * 365
-    }
+    n = len(data) if hasattr(data, '__len__') else int(data)
+
+    def build(dt, label=None, estimated=False):
+        steps_per_day = int(round(24 / dt))
+        if label is None:
+            minutes = dt * 60
+            label = "Stündlich" if abs(minutes - 60) < 1e-6 else f"{minutes:.0f}-Minuten"
+        return {
+            'dt': dt,
+            'resolution': label,
+            'steps_per_day': steps_per_day,
+            'steps_per_year': steps_per_day * 365,
+            'estimated': estimated,
+        }
+
+    # Methode 1: Zeitstempel
+    if isinstance(index, pd.DatetimeIndex) and len(index) > 2:
+        try:
+            minutes = index.to_series().diff().dropna().median().total_seconds() / 60
+            if 1 <= minutes <= 60 and abs(60 / minutes - round(60 / minutes)) < 1e-6:
+                return build(minutes / 60)
+        except Exception:
+            pass
+
+    # Methode 2: volles Jahr anhand der Datenpunktanzahl
+    if 34900 <= n <= 35200:      # 365/366 Tage * 96
+        return build(0.25)
+    if 8700 <= n <= 8800:        # 365/366 Tage * 24
+        return build(1.0)
+    if 17400 <= n <= 17600:      # 365/366 Tage * 48
+        return build(0.5)
+
+    # Methode 3: Schätzung
+    if n > 10000:
+        return build(0.25, "15-Minuten (geschätzt)", estimated=True)
+    return build(1.0, "Stündlich (geschätzt)", estimated=True)
 
 
 def parse_datetime_column(series):
@@ -734,677 +725,39 @@ def format_number(value, decimals=0, suffix=""):
         return f"{value:,.{decimals}f} {suffix}".strip()
 
 
-def calculate_curtailment(generation_profile, max_grid_power, storage_capacity_mwh, 
-                          storage_power_mw, efficiency, soc_min, soc_max):
+def run_model(func, *args, **kwargs):
     """
-    Berechnet die Abregelung bei gegebener Speichergröße.
-    
-    Returns:
-        dict mit Ergebnissen (Abregelung, gespeicherte Energie, etc.)
+    Ruft ein Rechenmodell aus speicher_modell auf und zeigt Fehler
+    (unlösbare Optimierung, unpassende Eingabedaten) verständlich an.
     """
-    n = len(generation_profile)
-    
-    # Arrays initialisieren
-    soc = np.zeros(n + 1)
-    soc[0] = (soc_min + soc_max) / 2 * storage_capacity_mwh  # Start bei 50%
-    
-    curtailment = np.zeros(n)
-    grid_feed_in = np.zeros(n)
-    storage_charge = np.zeros(n)
-    storage_discharge = np.zeros(n)
-    
-    soc_min_mwh = soc_min * storage_capacity_mwh
-    soc_max_mwh = soc_max * storage_capacity_mwh
-    
-    # Zeitauflösung erkennen
-    time_res = detect_time_resolution(n)
-    dt = time_res['dt']
-    
-    for t in range(n):
-        gen = generation_profile.iloc[t]
-        
-        if gen > max_grid_power:
-            # Überschuss vorhanden
-            excess = gen - max_grid_power
-            
-            # Wie viel kann gespeichert werden?
-            available_capacity = soc_max_mwh - soc[t]
-            max_charge_power = min(storage_power_mw, available_capacity / dt / efficiency)
-            actual_charge = min(excess, max_charge_power)
-            
-            storage_charge[t] = actual_charge
-            curtailment[t] = excess - actual_charge
-            grid_feed_in[t] = max_grid_power
-            
-            soc[t + 1] = soc[t] + actual_charge * efficiency * dt
-            
-        else:
-            # Erzeugung unter Anschlussleistung
-            grid_feed_in[t] = gen
-            
-            # Kann der Speicher zusätzlich einspeisen?
-            grid_headroom = max_grid_power - gen
-            available_energy = soc[t] - soc_min_mwh
-            max_discharge_power = min(storage_power_mw, available_energy / dt)
-            actual_discharge = min(grid_headroom, max_discharge_power * efficiency)
-            
-            storage_discharge[t] = actual_discharge / efficiency
-            grid_feed_in[t] += actual_discharge
-            
-            soc[t + 1] = soc[t] - actual_discharge / efficiency * dt
-    
-    return {
-        'curtailment_mwh': curtailment.sum() * dt,
-        'curtailment_profile': curtailment,
-        'grid_feed_in_mwh': grid_feed_in.sum() * dt,
-        'grid_feed_in_profile': grid_feed_in,
-        'storage_cycles': (storage_charge.sum() * dt) / storage_capacity_mwh if storage_capacity_mwh > 0 else 0,
-        'soc_profile': soc[:-1],
-        'total_generation_mwh': generation_profile.sum() * dt,
-    }
-
-
-def optimize_storage_size(generation_profile, max_grid_power, price_profile,
-                          technical_params, economic_params, 
-                          capacity_range=(10, 500), power_range=(5, 250), steps=20):
-    """
-    Iterative Optimierung der Speichergröße.
-    
-    Variiert Kapazität und Leistung und berechnet für jede Kombination:
-    - Vermiedene Abregelung
-    - Arbitrage-Erlöse
-    - Wirtschaftlichkeit (NPV)
-    """
-    results = []
-    
-    capacities = np.linspace(capacity_range[0], capacity_range[1], steps)
-    
-    for capacity in capacities:
-        # Leistung als Funktion der Kapazität (E/P zwischen 1 und 4)
-        for ep_ratio in [1, 2, 3, 4]:
-            power = capacity / ep_ratio
-            
-            if power < power_range[0] or power > power_range[1]:
-                continue
-            
-            # Abregelung berechnen
-            curtail_result = calculate_curtailment(
-                generation_profile=generation_profile,
-                max_grid_power=max_grid_power,
-                storage_capacity_mwh=capacity,
-                storage_power_mw=power,
-                efficiency=technical_params['efficiency'],
-                soc_min=technical_params['soc_min'],
-                soc_max=technical_params['soc_max']
-            )
-            
-            # Arbitrage-Erlöse berechnen (vereinfacht)
-            if price_profile is not None and len(price_profile) > 0:
-                arbitrage_revenue = estimate_arbitrage_revenue(
-                    capacity_mwh=capacity,
-                    power_mw=power,
-                    price_profile=price_profile,
-                    efficiency=technical_params['efficiency'],
-                    cycles_available=365 - curtail_result['storage_cycles']
-                )
-            else:
-                arbitrage_revenue = 0
-            
-            # Erlös aus vermiedener Abregelung
-            avg_price = price_profile.mean() if price_profile is not None else 50
-            avoided_curtailment_revenue = curtail_result['curtailment_mwh'] * avg_price * -1  # Negativ, da vermieden
-            # Korrektur: Vermiedene Abregelung ist positiv
-            generation_without_storage = calculate_curtailment(
-                generation_profile, max_grid_power, 0, 0,
-                technical_params['efficiency'],
-                technical_params['soc_min'],
-                technical_params['soc_max']
-            )
-            avoided_curtailment = generation_without_storage['curtailment_mwh'] - curtail_result['curtailment_mwh']
-            avoided_curtailment_revenue = avoided_curtailment * avg_price
-            
-            # Investitionskosten
-            capex = (capacity * 1000 * economic_params['capex_energy'] + 
-                    power * 1000 * economic_params['capex_power'])
-            
-            # Jährliche Betriebskosten
-            opex = capex * economic_params['opex_rate'] / 100
-            
-            # Jährlicher Erlös
-            annual_revenue = arbitrage_revenue + avoided_curtailment_revenue
-            
-            # NPV berechnen
-            discount_rate = economic_params['discount_rate'] / 100
-            lifetime = economic_params['project_lifetime']
-            
-            npv = -capex
-            for year in range(1, lifetime + 1):
-                npv += (annual_revenue - opex) / ((1 + discount_rate) ** year)
-            
-            results.append({
-                'capacity_mwh': capacity,
-                'power_mw': power,
-                'ep_ratio': ep_ratio,
-                'curtailment_mwh': curtail_result['curtailment_mwh'],
-                'avoided_curtailment_mwh': avoided_curtailment,
-                'arbitrage_revenue': arbitrage_revenue,
-                'avoided_curtailment_revenue': avoided_curtailment_revenue,
-                'total_revenue': annual_revenue,
-                'capex': capex,
-                'opex': opex,
-                'npv': npv,
-                'storage_cycles': curtail_result['storage_cycles'],
-            })
-    
-    return pd.DataFrame(results)
-
-
-def estimate_arbitrage_revenue(capacity_mwh, power_mw, price_profile, efficiency, cycles_available,
-                               include_intraday=True, daily_cycles_target=1.5):
-    """
-    Schätzt die Arbitrage-Erlöse basierend auf Preisspreads.
-    
-    Realistische Berechnung für 2024/2025:
-    - Day-Ahead Spreads (P90-P10 oder Max-Min)
-    - Intraday-Aufschlag (typisch +30-50% auf Day-Ahead)
-    - 1.5-2 Zyklen pro Tag realistisch für moderne Speicher
-    
-    Args:
-        capacity_mwh: Speicherkapazität in MWh
-        power_mw: Speicherleistung in MW
-        price_profile: Preiszeitreihe (optional)
-        efficiency: Roundtrip-Wirkungsgrad
-        cycles_available: Verfügbare Zyklen (Lebensdauer-Limit)
-        include_intraday: Intraday-Erlöse einbeziehen (Default: True)
-        daily_cycles_target: Ziel-Zyklen pro Tag (Default: 1.5)
-    
-    Returns:
-        Geschätzte jährliche Arbitrage-Erlöse in €
-    """
-    if capacity_mwh <= 0 or power_mw <= 0:
-        return 0
-    
-    # Nutzbare Kapazität (80% der Nennkapazität typisch)
-    usable_capacity = capacity_mwh * (0.9 - 0.1)
-    
-    # E/P-Verhältnis bestimmt max. Zyklen pro Tag
-    ep_ratio = capacity_mwh / power_mw if power_mw > 0 else 2
-    # Bei 2h Speicher: theoretisch bis zu 4-5 Zyklen möglich, praktisch 1.5-2.5
-    max_physical_cycles = 24 / (ep_ratio * 2)  # Laden + Entladen
-    
-    # Realistische tägliche Zyklen (marktgetrieben)
-    daily_cycles = min(daily_cycles_target, max_physical_cycles, 2.5)  # Max 2.5 Zyklen/Tag
-    
-    # Jährliche Zyklen (begrenzt durch Batterielebensdauer)
-    annual_cycles = min(365 * daily_cycles, cycles_available)
-    
-    # Preisspreads berechnen
-    if price_profile is not None and len(price_profile) > 96:
-        prices = price_profile.values if hasattr(price_profile, 'values') else price_profile
-        
-        # P90-P10 Spread (robuster als Max-Min)
-        p90 = np.percentile(prices, 90)
-        p10 = np.percentile(prices, 10)
-        avg_spread_da = p90 - p10
-        
-        # Tägliche Spreads für Variabilität
-        n_days = len(prices) // 96
-        daily_spreads = []
-        for day in range(min(n_days, 365)):
-            day_prices = prices[day * 96:(day + 1) * 96]
-            if len(day_prices) > 0:
-                spread = np.percentile(day_prices, 90) - np.percentile(day_prices, 10)
-                daily_spreads.append(spread)
-        
-        avg_spread_da = np.mean(daily_spreads) if daily_spreads else avg_spread_da
-    else:
-        # Default-Spread für 2024/2025 Marktbedingungen (deutlich höher als früher)
-        avg_spread_da = 65  # €/MWh Day-Ahead Spread (P90-P10)
-    
-    # Intraday-Aufschlag (Intraday-Handel bringt typisch 30-50% mehr)
-    if include_intraday:
-        intraday_factor = 1.35  # +35% durch Intraday-Optimierung
-    else:
-        intraday_factor = 1.0
-    
-    effective_spread = avg_spread_da * intraday_factor
-    
-    # Erlös pro Zyklus
-    revenue_per_cycle = usable_capacity * effective_spread * efficiency
-    
-    # Gesamterlös
-    total_revenue = annual_cycles * revenue_per_cycle
-    
-    return total_revenue
-
-
-def optimize_capacity_allocation(storage_capacity_mwh, storage_power_mw, 
-                                 price_profile, fcr_prices, afrr_prices,
-                                 efficiency, soc_min, soc_max):
-    """
-    Optimiert die Aufteilung der Speicherkapazität zwischen FCR, aFRR und Arbitrage.
-    
-    FCR-Anforderungen:
-    - Symmetrische Vorhaltung (positiv und negativ)
-    - 30-Minuten-Lieferfähigkeit bei vollem Abruf
-    
-    Aktualisiert für 2024/2025 Marktbedingungen:
-    - Höhere Default-Preise
-    - Realistische Zyklenzahlen
-    
-    Returns:
-        dict mit optimaler Aufteilung und Erlösen
-    """
-    results = []
-    
-    usable_capacity = storage_capacity_mwh * (soc_max - soc_min)
-    
-    # FCR: Max. Leistung basierend auf 30-min Lieferfähigkeit
-    # Symmetrisch: Muss in beide Richtungen liefern können
-    max_fcr_power = usable_capacity / 0.5 / 2  # 0.5h * 2 (symmetrisch)
-    max_fcr_power = min(max_fcr_power, storage_power_mw)
-    
-    # Durchschnittliche Preise (aktualisiert für 2024/2025)
-    avg_fcr_price = fcr_prices.mean() if fcr_prices is not None and len(fcr_prices) > 0 else 18  # €/MW/h (war: 15)
-    avg_afrr_price = afrr_prices.mean() if afrr_prices is not None and len(afrr_prices) > 0 else 10  # €/MW/h (war: 8)
-    
-    # Iteriere über verschiedene Aufteilungen
-    for fcr_share in np.arange(0, 1.01, 0.1):
-        for afrr_share in np.arange(0, 1.01 - fcr_share, 0.1):
-            arbitrage_share = 1 - fcr_share - afrr_share
-            
-            # Leistungsaufteilung
-            fcr_power = min(max_fcr_power * fcr_share, storage_power_mw * fcr_share)
-            afrr_power = storage_power_mw * afrr_share
-            arbitrage_power = storage_power_mw * arbitrage_share
-            
-            # Kapazitätsaufteilung
-            # FCR benötigt Kapazität für 30-min Vorhaltung (symmetrisch)
-            fcr_capacity_needed = fcr_power * 0.5 * 2
-            afrr_capacity_needed = afrr_power * 0.25 * 2  # 15-min Aktivierung
-            arbitrage_capacity = usable_capacity - fcr_capacity_needed - afrr_capacity_needed
-            
-            if arbitrage_capacity < 0:
-                continue
-            
-            # Erlöse berechnen (nur Leistungsvorhaltung)
-            hours_per_year = 8760
-            
-            fcr_revenue = fcr_power * avg_fcr_price * hours_per_year
-            afrr_revenue = afrr_power * avg_afrr_price * hours_per_year
-            
-            # Arbitrage-Erlöse (verbesserte Berechnung)
-            if arbitrage_capacity > 0:
-                arbitrage_revenue = estimate_arbitrage_revenue(
-                    capacity_mwh=arbitrage_capacity / (soc_max - soc_min),
-                    power_mw=arbitrage_power,
-                    price_profile=price_profile,
-                    efficiency=efficiency,
-                    cycles_available=700,  # Erhöht von 500 auf 700 Zyklen
-                    include_intraday=True,
-                    daily_cycles_target=1.5
-                )
-            else:
-                arbitrage_revenue = 0
-            
-            total_revenue = fcr_revenue + afrr_revenue + arbitrage_revenue
-            
-            results.append({
-                'fcr_share': fcr_share,
-                'afrr_share': afrr_share,
-                'arbitrage_share': arbitrage_share,
-                'fcr_power_mw': fcr_power,
-                'afrr_power_mw': afrr_power,
-                'arbitrage_power_mw': arbitrage_power,
-                'fcr_revenue': fcr_revenue,
-                'afrr_revenue': afrr_revenue,
-                'arbitrage_revenue': arbitrage_revenue,
-                'total_revenue': total_revenue,
-            })
-    
-    df = pd.DataFrame(results)
-    
-    if len(df) > 0:
-        optimal = df.loc[df['total_revenue'].idxmax()]
-        return {
-            'optimal': optimal.to_dict(),
-            'all_results': df,
-        }
-    else:
-        return None
-
-
-def calculate_peak_shaving(load_profile, target_limit, storage_power_mw, 
-                           storage_capacity_mwh, efficiency, soc_min, soc_max,
-                           pv_surplus=None):
-    """
-    Berechnet das Peak Shaving Ergebnis mit PyPSA-Optimierung.
-    
-    Zielfunktion: Minimiere Netzbezugskosten + Spitzenlastkosten
-    
-    Komponenten:
-    - Bus: Lastknoten
-    - Load: Verbraucherlast
-    - Generator (grid): Netzbezug (zu minimieren)
-    - Store: Batteriespeicher
-    - Generator (pv_surplus): PV-Überschuss (falls vorhanden)
-    """
-    n = len(load_profile)
-    
-    # Zeitauflösung erkennen
-    time_res = detect_time_resolution(n)
-    dt = time_res['dt']
-    
-    # Effizienz aufteilen (sqrt für Laden und Entladen)
-    eta_charge = np.sqrt(efficiency)
-    eta_discharge = np.sqrt(efficiency)
-    
-    # Nutzbare Kapazität
-    usable_capacity = storage_capacity_mwh * (soc_max - soc_min)
-    initial_soc = usable_capacity * 0.5  # Start bei 50% der nutzbaren Kapazität
-    
-    has_pv = pv_surplus is not None and len(pv_surplus) == n
-    
-    # PyPSA Netzwerk erstellen
-    network = pypsa.Network()
-    network.set_snapshots(range(n))
-    
-    # Zeitauflösung setzen (für korrekte Energieberechnung)
-    network.snapshot_weightings.loc[:, "generators"] = dt
-    network.snapshot_weightings.loc[:, "stores"] = dt
-    
-    # Bus (Lastknoten)
-    network.add("Bus", "load_bus")
-    
-    # Last
-    network.add("Load", "demand",
-                bus="load_bus",
-                p_set=load_profile.values)
-    
-    # Netzbezug - mit hohen Kosten für Spitzen
-    # Grundlast günstig, alles über target_limit sehr teuer
-    network.add("Generator", "grid_base",
-                bus="load_bus",
-                p_nom=target_limit,
-                marginal_cost=1)  # Normale Netzkosten
-    
-    network.add("Generator", "grid_peak",
-                bus="load_bus",
-                p_nom=load_profile.max() * 2,  # Genug Kapazität
-                marginal_cost=1000)  # Sehr teuer = vermeiden
-    
-    # Batteriespeicher
-    network.add("Store", "battery",
-                bus="load_bus",
-                e_nom=usable_capacity,
-                e_initial=initial_soc,
-                e_cyclic=False,
-                standing_loss=0,
-                e_min_pu=0,
-                e_max_pu=1)
-    
-    # Laden und Entladen über Links für Wirkungsgrad
-    network.add("Bus", "battery_internal")
-    
-    network.add("Link", "charge",
-                bus0="load_bus",
-                bus1="battery_internal",
-                p_nom=storage_power_mw,
-                efficiency=eta_charge,
-                marginal_cost=0.1)  # Kleine Kosten für Laden
-    
-    network.add("Link", "discharge",
-                bus0="battery_internal",
-                bus1="load_bus",
-                p_nom=storage_power_mw,
-                efficiency=eta_discharge,
-                marginal_cost=0)
-    
-    # Store mit internem Bus verbinden
-    network.stores.loc["battery", "bus"] = "battery_internal"
-    
-    # PV-Überschuss (falls vorhanden)
-    if has_pv:
-        # PV-Überschuss als negative Last (Einspeisung)
-        network.add("Generator", "pv_surplus",
-                    bus="load_bus",
-                    p_nom=pv_surplus.max() if pv_surplus.max() > 0 else 1,
-                    p_max_pu=np.clip(pv_surplus.values / max(pv_surplus.max(), 0.001), 0, 1),
-                    marginal_cost=-0.01)  # Kleiner Bonus für PV-Nutzung
-    
-    # Optimieren
     try:
-        status = network.optimize(solver_name="highs", solver_options={"threads": 1})
-        
-        if status[0] != "ok":
-            st.warning(f"⚠️ Optimierung nicht optimal gelöst: {status}")
-            return None
-    except Exception as e:
-        st.error(f"❌ PyPSA-Optimierungsfehler: {e}")
+        return func(*args, **kwargs)
+    except (sm.OptimizationError, ValueError) as exc:
+        st.error(f"❌ {exc}")
         return None
-    
-    # Ergebnisse extrahieren
-    grid_base = network.generators_t.p["grid_base"].values
-    grid_peak = network.generators_t.p["grid_peak"].values
-    grid_power = grid_base + grid_peak
-    
-    # Speicherleistung: positiv = entladen, negativ = laden
-    charge_power = network.links_t.p0["charge"].values
-    discharge_power = network.links_t.p1["discharge"].values
-    battery_power = discharge_power - charge_power
-    
-    soc = network.stores_t.e["battery"].values
-    
-    # SOC in absoluten Werten (mit soc_min Offset)
-    soc_absolute = soc + soc_min * storage_capacity_mwh
-    
-    original_peak = load_profile.max()
-    new_peak = grid_power.max()
-    
-    # Unmet peaks (wo grid_peak > 0)
-    unmet_peaks = np.maximum(grid_power - target_limit, 0)
-    
-    result = {
-        'original_peak_mw': original_peak,
-        'new_peak_mw': new_peak,
-        'peak_reduction_mw': original_peak - new_peak,
-        'target_achieved': new_peak <= target_limit * 1.01,
-        'unmet_peaks_count': (grid_peak > 0.01).sum(),
-        'grid_power_profile': grid_power,
-        'battery_power_profile': battery_power,
-        'soc_profile': soc_absolute,
-        'optimization_status': 'optimal',
-        'objective_value': network.objective,
-    }
-    
-    if has_pv:
-        pv_used = network.generators_t.p["pv_surplus"].values if "pv_surplus" in network.generators.index else np.zeros(n)
-        result['pv_to_battery_mwh'] = pv_used.sum() * dt
-        result['pv_to_battery_profile'] = pv_used
-    
-    return result
 
 
-def optimize_peak_shaving_storage(load_profile, target_limit, efficiency, soc_min, soc_max,
-                                   max_power_mw, max_capacity_mwh, pv_surplus=None,
-                                   capex_power=80, capex_energy=250,
-                                   interest_rate=0.05, lifetime_years=15, opex_rate=0.02):
+def get_time_resolution(key, n):
     """
-    Optimiert Speicherleistung UND -kapazität in einem PyPSA-Lauf.
-    
-    Findet die minimale Speichergröße, die das Peak-Shaving-Ziel erreicht.
-    
-    Args:
-        load_profile: Lastprofil (MW)
-        target_limit: Ziel-Lastgrenze (MW)
-        max_power_mw: Maximale Speicherleistung (MW)
-        max_capacity_mwh: Maximale Speicherkapazität (MWh)
-        capex_power: Kosten pro kW Leistung (€/kW)
-        capex_energy: Kosten pro kWh Kapazität (€/kWh)
-        interest_rate: Zinssatz für Annuität (z.B. 0.05 = 5%)
-        lifetime_years: Lebensdauer für Annuität (Jahre)
-        opex_rate: Betriebskosten als Anteil von CAPEX (z.B. 0.02 = 2%)
-    
-    Returns:
-        dict mit optimaler Konfiguration und Ergebnissen
+    Liefert die beim Upload erkannte Zeitauflösung (aus dem Zeitstempel-Index).
+    Nur wenn nichts gespeichert ist, wird aus der Datenpunktzahl geschätzt.
     """
-    n = len(load_profile)
-    
-    # Zeitauflösung erkennen
-    time_res = detect_time_resolution(n)
-    dt = time_res['dt']
-    
-    eta_charge = np.sqrt(efficiency)
-    eta_discharge = np.sqrt(efficiency)
-    
-    has_pv = pv_surplus is not None and len(pv_surplus) == n
-    
-    # === Annuität berechnen (KORREKT!) ===
-    annuity_factor = calculate_annuity_factor(interest_rate, lifetime_years)
-    
-    # Jährliche Kosten pro Einheit (CAPEX annualisiert + OPEX)
-    annual_capex_energy = capex_energy * 1000 * annuity_factor  # €/MWh/Jahr
-    annual_opex_energy = capex_energy * 1000 * opex_rate        # €/MWh/Jahr
-    annual_cost_energy = annual_capex_energy + annual_opex_energy
-    
-    annual_capex_power = capex_power * 1000 * annuity_factor    # €/MW/Jahr
-    annual_opex_power = capex_power * 1000 * opex_rate          # €/MW/Jahr
-    annual_cost_power = annual_capex_power + annual_opex_power
-    
-    # PyPSA Netzwerk erstellen
-    network = pypsa.Network()
-    network.set_snapshots(range(n))
-    
-    network.snapshot_weightings.loc[:, "generators"] = dt
-    network.snapshot_weightings.loc[:, "stores"] = dt
-    network.snapshot_weightings.loc[:, "links"] = dt
-    
-    # Bus
-    network.add("Bus", "load_bus")
-    network.add("Bus", "battery_bus")
-    
-    # Last
-    network.add("Load", "demand",
-                bus="load_bus",
-                p_set=load_profile.values)
-    
-    # Netzbezug - Grundlast bis target_limit günstig
-    network.add("Generator", "grid_base",
-                bus="load_bus",
-                p_nom=target_limit,
-                marginal_cost=1)
-    
-    # Spitzenlast sehr teuer (zu vermeiden)
-    network.add("Generator", "grid_peak",
-                bus="load_bus",
-                p_nom=load_profile.max() * 2,
-                marginal_cost=10000)  # Sehr hohe Kosten = starker Anreiz zur Vermeidung
-    
-    # Batteriespeicher mit ERWEITERBARER Kapazität
-    network.add("Store", "battery",
-                bus="battery_bus",
-                e_nom=0,  # Startwert
-                e_nom_extendable=True,
-                e_nom_min=0,
-                e_nom_max=max_capacity_mwh * (soc_max - soc_min),
-                e_cyclic=False,
-                e_initial_per_period=0.5,  # Start bei 50%
-                standing_loss=0,
-                capital_cost=annual_cost_energy)  # Korrekte Annuität!
-    
-    # Laden mit ERWEITERBARER Leistung
-    network.add("Link", "charge",
-                bus0="load_bus",
-                bus1="battery_bus",
-                p_nom=0,
-                p_nom_extendable=True,
-                p_nom_min=0,
-                p_nom_max=max_power_mw,
-                efficiency=eta_charge,
-                marginal_cost=0.1,
-                capital_cost=annual_cost_power / 2)  # Korrekte Annuität!
-    
-    # Entladen mit ERWEITERBARER Leistung
-    network.add("Link", "discharge",
-                bus0="battery_bus",
-                bus1="load_bus",
-                p_nom=0,
-                p_nom_extendable=True,
-                p_nom_min=0,
-                p_nom_max=max_power_mw,
-                efficiency=eta_discharge,
-                marginal_cost=0,
-                capital_cost=annual_cost_power / 2)  # Korrekte Annuität!
-    
-    # PV-Überschuss (falls vorhanden)
-    if has_pv:
-        network.add("Generator", "pv_surplus",
-                    bus="load_bus",
-                    p_nom=pv_surplus.max() if pv_surplus.max() > 0 else 1,
-                    p_max_pu=np.clip(pv_surplus.values / max(pv_surplus.max(), 0.001), 0, 1),
-                    marginal_cost=-0.01)
-    
-    # Optimieren
-    try:
-        status = network.optimize(solver_name="highs", solver_options={"threads": 1})
-        
-        if status[0] != "ok":
-            return None
-    except Exception as e:
-        return None
-    
-    # Optimale Größen extrahieren
-    optimal_capacity = network.stores.loc["battery", "e_nom_opt"]
-    optimal_power_charge = network.links.loc["charge", "p_nom_opt"]
-    optimal_power_discharge = network.links.loc["discharge", "p_nom_opt"]
-    optimal_power = max(optimal_power_charge, optimal_power_discharge)
-    
-    # Ergebnisse extrahieren
-    grid_base = network.generators_t.p["grid_base"].values
-    grid_peak = network.generators_t.p["grid_peak"].values
-    grid_power = grid_base + grid_peak
-    
-    charge_power = network.links_t.p0["charge"].values
-    discharge_power = network.links_t.p1["discharge"].values
-    battery_power = discharge_power - charge_power
-    
-    soc = network.stores_t.e["battery"].values
-    
-    # Kapazität zurückrechnen auf Gesamt (inkl. SOC-Grenzen)
-    total_capacity = optimal_capacity / (soc_max - soc_min) if (soc_max - soc_min) > 0 else optimal_capacity
-    soc_absolute = soc + soc_min * total_capacity
-    
-    original_peak = load_profile.max()
-    new_peak = grid_power.max()
-    
-    result = {
-        'optimal_capacity_mwh': total_capacity,
-        'optimal_power_mw': optimal_power,
-        'original_peak_mw': original_peak,
-        'new_peak_mw': new_peak,
-        'peak_reduction_mw': original_peak - new_peak,
-        'target_achieved': new_peak <= target_limit * 1.01,
-        'unmet_peaks_count': (grid_peak > 0.01).sum(),
-        'grid_power_profile': grid_power,
-        'battery_power_profile': battery_power,
-        'soc_profile': soc_absolute,
-        'optimization_status': 'optimal',
-        'objective_value': network.objective,
-        'ep_ratio': total_capacity / optimal_power if optimal_power > 0 else 0,
-        # Wirtschaftliche Parameter
-        'annuity_factor': annuity_factor,
-        'annual_cost_energy': annual_cost_energy,
-        'annual_cost_power': annual_cost_power,
-        'annual_capex_energy': annual_capex_energy,
-        'annual_opex_energy': annual_opex_energy,
-    }
-    
-    if has_pv:
-        pv_used = network.generators_t.p["pv_surplus"].values if "pv_surplus" in network.generators.index else np.zeros(n)
-        result['pv_to_battery_mwh'] = pv_used.sum() * dt
-        result['pv_to_battery_profile'] = pv_used
-    
-    return result
+    time_res = st.session_state.get(key)
+    if time_res is None:
+        time_res = detect_time_resolution(n)
+    return time_res
+
+
+def warn_if_not_full_year(n, dt):
+    """Hinweis, wenn die Zeitreihe kein volles Jahr abdeckt."""
+    yf = sm.year_fraction(n, dt)
+    if yf < 0.97 or yf > 1.03:
+        st.warning(
+            f"⚠️ Die Zeitreihe deckt {n * dt / 24:.0f} Tage ab (kein volles Jahr). "
+            "Energiemengen, Erlöse und Zyklen werden linear auf ein Jahr hochgerechnet – "
+            "saisonale Effekte gehen dabei verloren. Für eine belastbare Auslegung "
+            "bitte ein vollständiges Jahr verwenden."
+        )
 
 
 # =============================================================================
@@ -1748,7 +1101,8 @@ def show_mode_a_step2():
                 max_value=300000,
                 value=160000,
                 step=10000,
-                help="Typisch 2024: 130.000-200.000 €/MW/Jahr. FCR-Preise schwanken stark (10-30 €/MW/h)."
+                help="Je MW vermarkteter Leistung und Jahr. Umrechnung: Ø-Preis in €/MW/h × 8.760 h "
+                     "(z.B. 15 €/MW/h ≈ 131.000 €/MW/Jahr). Bitte mit aktuellen Daten von regelleistung.net prüfen."
             )
             
             revenue_afrr = st.number_input(
@@ -1757,7 +1111,8 @@ def show_mode_a_step2():
                 max_value=150000,
                 value=70000,
                 step=5000,
-                help="Typisch: 90.000-140.000 €/MW/Jahr (Leistungspreis + Arbeitspreis)"
+                help="Je MW vermarkteter Leistung und Jahr (Leistungspreis + Arbeitspreis). Stark marktabhängig – "
+                     "bitte mit aktuellen Daten von regelleistung.net prüfen."
             )
             
             st.markdown("##### 💹 Arbitrage (Day-Ahead + Intraday)")
@@ -1768,13 +1123,15 @@ def show_mode_a_step2():
                 max_value=200000,
                 value=35000,
                 step=2500,
-                help="Typisch 2024: 80.000-150.000 €/MWh/Jahr bei 1.5-2 Zyklen/Tag und 50-80 €/MWh Spread"
+                help="Je MWh Speicherkapazität und Jahr. Faustformel: Zyklen/Tag × 365 × Spread × Wirkungsgrad × nutzbarer Anteil, "
+                     "z.B. 1,5 × 365 × 65 €/MWh × 0,9 × 0,8 ≈ 25.000-35.000 €/MWh/Jahr"
             )
             
             st.markdown("""
             <div class="warning-box">
-                <strong>💡 Tipp:</strong> Bei hoher Preisvolatilität (wie 2022/2023) können 
-                Arbitrage-Erlöse deutlich höher sein (bis 140.000 €/MWh/Jahr).
+                <strong>💡 Hinweis:</strong> Die Vorgabewerte stammen aus 2024 und sind Annahmen, keine
+                Prognose. Der FCR-Markt ist klein und für neue Großspeicher nur begrenzt aufnahmefähig –
+                für eine belastbare Rechnung besser eigene Marktdaten hochladen.
             </div>
             """, unsafe_allow_html=True)
         
@@ -1787,8 +1144,12 @@ def show_mode_a_step2():
             """)
             
             share_fcr = st.slider("FCR-Anteil (%)", 0, 100, 55, key="share_fcr_a") / 100
-            share_afrr = st.slider("aFRR-Anteil (%)", 0, 100 - int(share_fcr*100), 15, key="share_afrr_a") / 100
-            share_arbitrage = 1 - share_fcr - share_afrr
+            afrr_max = 100 - int(round(share_fcr * 100))
+            if afrr_max > 0:
+                share_afrr = st.slider("aFRR-Anteil (%)", 0, afrr_max, min(15, afrr_max), key="share_afrr_a") / 100
+            else:
+                share_afrr = 0.0
+            share_arbitrage = max(0.0, 1 - share_fcr - share_afrr)
             
             st.info(f"Verbleibender Arbitrage-Anteil: {share_arbitrage*100:.0f}%")
             
@@ -1827,6 +1188,7 @@ def show_mode_a_step2():
             st.metric("Provision", f"{total_annual_revenue * marketer_fee / 100:,.0f} €/Jahr")
         
         st.session_state.annual_revenue_a = net_revenue
+        st.session_state.cycles_per_day_a = 1.5 * share_arbitrage
         st.session_state.revenue_details_a = {
             'fcr': annual_revenue_fcr,
             'afrr': annual_revenue_afrr,
@@ -1840,25 +1202,38 @@ def show_mode_a_step2():
         # Eigene Marktdaten hochladen
         st.markdown("---")
         st.markdown("#### 📁 Marktdaten hochladen")
-        
+
+        st.markdown("""
+        <div class="info-box">
+            <strong>Methode:</strong> Der Arbitrage-Erlös wird als <strong>optimaler Fahrplan gegen die
+            hochgeladene Preiszeitreihe</strong> berechnet (lineare Optimierung, inkl. Wirkungsgradverlusten
+            und Zyklenbegrenzung) – nicht über einen pauschalen Jahres-Spread. Das Ergebnis ist eine
+            <em>obere Schranke</em> für den Day-Ahead-Markt (perfekte Preisvoraussicht). Leistung und
+            Kapazität werden zwischen FCR, aFRR und Arbitrage <strong>aufgeteilt</strong> – jede MW kann
+            nur einmal vermarktet werden.
+        </div>
+        """, unsafe_allow_html=True)
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.markdown("##### 💶 Day-Ahead-Preise")
             price_file = st.file_uploader(
                 "Day-Ahead-Preise hochladen",
                 type=['csv', 'xlsx', 'xls'],
                 key="price_upload_a",
-                help="Zeitreihe mit Strompreisen in €/MWh"
+                help="Zeitreihe mit Strompreisen in €/MWh (stündlich oder 15-min, möglichst ein volles Jahr)"
             )
-            
+
             if price_file is not None:
                 df = load_csv_file(price_file)
                 if df is not None:
-                    st.session_state.price_profile_a = df.iloc[:, 0]
                     prices = df.iloc[:, 0]
-                    st.success(f"✓ {len(df)} Preisdaten geladen")
-                    
+                    st.session_state.price_profile_a = prices
+                    st.session_state.time_resolution_a = detect_time_resolution(len(prices), df.index)
+                    st.success(f"✓ {len(df)} Preisdaten geladen "
+                               f"({st.session_state.time_resolution_a['resolution']})")
+
                     col_s1, col_s2, col_s3 = st.columns(3)
                     with col_s1:
                         st.metric("Mittelwert", f"{prices.mean():.1f} €/MWh")
@@ -1866,85 +1241,133 @@ def show_mode_a_step2():
                         st.metric("Spread (P90-P10)", f"{np.percentile(prices, 90) - np.percentile(prices, 10):.1f} €/MWh")
                     with col_s3:
                         st.metric("Volatilität", f"{prices.std():.1f} €/MWh")
-        
+
         with col2:
-            st.markdown("##### ⚡ FCR-Preise (optional)")
+            st.markdown("##### ⚡ Regelleistungspreise")
             fcr_file = st.file_uploader(
-                "FCR-Preise hochladen",
+                "FCR-Preise hochladen (optional)",
                 type=['csv', 'xlsx', 'xls'],
                 key="fcr_upload_a",
-                help="Primärregelleistungspreise in €/MW/h"
+                help="Primärregelleistungspreise in €/MW/h (4h-Produktpreise in €/MW vorher durch 4 teilen)"
             )
-            
+
+            fcr_mean = None
             if fcr_file is not None:
                 df = load_csv_file(fcr_file)
                 if df is not None:
-                    st.session_state.fcr_prices_a = df.iloc[:, 0]
-                    st.success(f"✓ FCR-Preise geladen (Mittel: {df.iloc[:, 0].mean():.1f} €/MW/h)")
-            else:
-                fcr_mean = st.number_input("Oder FCR-Durchschnittspreis (€/MW/h)", 5.0, 50.0, 15.0, key="fcr_default_a")
-        
+                    fcr_mean = float(df.iloc[:, 0].mean())
+                    st.success(f"✓ FCR-Preise geladen (Mittel: {fcr_mean:.1f} €/MW/h)")
+            if fcr_mean is None:
+                fcr_mean = st.number_input("Oder FCR-Durchschnittspreis (€/MW/h)", 0.0, 100.0, 15.0, key="fcr_default_a")
+
+            afrr_mean = st.number_input(
+                "aFRR-Leistungspreis, Durchschnitt (€/MW/h)", 0.0, 100.0, 10.0, key="afrr_default_a",
+                help="Nur Leistungsvorhaltung; Arbeitspreiserlöse sind nicht enthalten."
+            )
+
         # Erlöse aus hochgeladenen Daten berechnen
         if st.session_state.get('price_profile_a') is not None:
             prices = st.session_state.price_profile_a
-            
-            # Arbitrage-Erlös schätzen (verbessert)
-            price_spread = np.percentile(prices, 90) - np.percentile(prices, 10)
-            usable_capacity = storage_capacity * (st.session_state.get('soc_max_a_val', 0.9) - 
-                                                   st.session_state.get('soc_min_a_val', 0.1))
-            
-            # Realistische Zyklen (1.5-2 pro Tag)
-            ep_ratio = storage_capacity / storage_power if storage_power > 0 else 2
-            daily_cycles = min(2.0, 24 / (ep_ratio * 2))  # Max 2 Zyklen/Tag
-            daily_cycles = max(1.5, daily_cycles)  # Min 1.5 Zyklen/Tag
-            annual_cycles = daily_cycles * 365
-            
-            # Intraday-Aufschlag berücksichtigen (+35%)
-            intraday_factor = 1.35
-            effective_spread = price_spread * intraday_factor
-            
-            annual_revenue_arb = effective_spread * annual_cycles * usable_capacity * efficiency
-            
-            # FCR-Erlös (erhöhter Default-Preis)
-            if st.session_state.get('fcr_prices_a') is not None:
-                fcr_mean = st.session_state.fcr_prices_a.mean()
+            time_res_a = get_time_resolution('time_resolution_a', len(prices))
+            dt_a = time_res_a['dt']
+            warn_if_not_full_year(len(prices), dt_a)
+
+            st.markdown("##### ⚙️ Vermarktungsannahmen")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                share_fcr = st.slider("FCR-Anteil der Leistung (%)", 0, 100, 55, key="share_fcr_upload_a") / 100
+                afrr_max = 100 - int(round(share_fcr * 100))
+                if afrr_max > 0:
+                    share_afrr = st.slider("aFRR-Anteil der Leistung (%)", 0, afrr_max,
+                                           min(15, afrr_max), key="share_afrr_upload_a") / 100
+                else:
+                    share_afrr = 0.0
+                share_arbitrage = max(0.0, 1 - share_fcr - share_afrr)
+                st.info(f"Arbitrage-Anteil: {share_arbitrage*100:.0f}%")
+            with col2:
+                max_cycles = st.number_input(
+                    "Max. Vollzyklen pro Tag", 0.25, 4.0, 1.5, 0.25, key="max_cycles_a",
+                    help="Begrenzung aus Garantie/Alterung. Bezogen auf die nutzbare Kapazität."
+                )
+                intraday_uplift = st.number_input(
+                    "Intraday-Aufschlag auf DA-Erlös (%)", 0.0, 100.0, 35.0, 5.0, key="intraday_uplift_a",
+                    help="Pauschaler Zuschlag für Intraday-Handel. Annahme – nicht aus den Daten abgeleitet!"
+                ) / 100
+            with col3:
+                marketer_fee = st.number_input("Provision Direktvermarkter (%)", 0, 30, 15, key="marketer_fee_a")
+
+            soc_min_a = st.session_state.get('soc_min_a_val', 0.1)
+            soc_max_a = st.session_state.get('soc_max_a_val', 0.9)
+            params_signature = (len(prices), float(prices.sum()), storage_power, storage_capacity,
+                                efficiency, share_fcr, share_afrr, max_cycles, soc_min_a, soc_max_a)
+
+            if st.button("🔍 Arbitrage-Fahrplan optimieren und Erlöse berechnen", type="primary",
+                         use_container_width=True):
+                with st.spinner("Optimiere Fahrplan gegen Preiszeitreihe..."):
+                    arb = run_model(
+                        sm.optimize_arbitrage,
+                        prices=prices, dt=dt_a,
+                        power_mw=storage_power * share_arbitrage,
+                        capacity_mwh=storage_capacity * share_arbitrage,
+                        efficiency=efficiency,
+                        soc_min=soc_min_a, soc_max=soc_max_a,
+                        max_cycles_per_day=max_cycles,
+                    )
+                if arb is not None:
+                    st.session_state.arbitrage_result_a = {
+                        'signature': params_signature,
+                        'annual_revenue': arb['annual_revenue'],
+                        'cycles_per_day': arb['cycles_per_day'],
+                        'cycles_per_year': arb['cycles_per_year'],
+                        'avg_buy_price': arb['avg_buy_price'],
+                        'avg_sell_price': arb['avg_sell_price'],
+                    }
+
+            arb_res = st.session_state.get('arbitrage_result_a')
+            if arb_res is not None and arb_res['signature'] != params_signature:
+                st.warning("⚠️ Annahmen wurden geändert – bitte die Erlöse neu berechnen.")
+                arb_res = None
+
+            if arb_res is None:
+                st.session_state.annual_revenue_a = None
+                st.session_state.revenue_details_a = None
             else:
-                fcr_mean = st.session_state.get('fcr_default_a', 18)  # Erhöht von 15 auf 18
-            
-            hours_per_year = len(prices) / 4 if len(prices) > 8760 else 8760
-            annual_revenue_fcr = fcr_mean * storage_power * hours_per_year * 0.55  # 55% FCR-Anteil (erhöht)
-            
-            # aFRR-Erlös (neu hinzugefügt)
-            afrr_mean = 10  # €/MW/h Default
-            annual_revenue_afrr = afrr_mean * storage_power * hours_per_year * 0.15  # 15% aFRR-Anteil
-            
-            total_annual_revenue = annual_revenue_fcr + annual_revenue_afrr + annual_revenue_arb
-            
-            # Provision
-            marketer_fee = st.number_input("Provision Direktvermarkter (%)", 5, 30, 15, key="marketer_fee_a")
-            net_revenue = total_annual_revenue * (1 - marketer_fee / 100)
-            
-            st.session_state.annual_revenue_a = net_revenue
-            st.session_state.revenue_details_a = {
-                'fcr': annual_revenue_fcr,
-                'afrr': annual_revenue_afrr,
-                'arbitrage': annual_revenue_arb,
-                'total_brutto': total_annual_revenue,
-                'marketer_fee': marketer_fee,
-                'total_netto': net_revenue
-            }
-            
-            # Info über die Berechnung
-            st.markdown(f"""
-            <div class="info-box">
-                <strong>Berechnungsgrundlage:</strong><br>
-                • Day-Ahead Spread (P90-P10): {price_spread:.1f} €/MWh<br>
-                • Mit Intraday-Optimierung (+35%): {effective_spread:.1f} €/MWh<br>
-                • Geschätzte Zyklen/Tag: {daily_cycles:.1f}<br>
-                • FCR-Preis: {fcr_mean:.1f} €/MW/h
-            </div>
-            """, unsafe_allow_html=True)
-    
+                annual_revenue_arb = arb_res['annual_revenue'] * (1 + intraday_uplift)
+                annual_revenue_fcr = fcr_mean * storage_power * share_fcr * 8760
+                annual_revenue_afrr = afrr_mean * storage_power * share_afrr * 8760
+                total_annual_revenue = annual_revenue_fcr + annual_revenue_afrr + annual_revenue_arb
+                net_revenue = total_annual_revenue * (1 - marketer_fee / 100)
+
+                st.session_state.annual_revenue_a = net_revenue
+                # Zyklen bezogen auf den GESAMTEN Speicher (für LCOS/Lebensdauer)
+                st.session_state.cycles_per_day_a = arb_res['cycles_per_day'] * share_arbitrage
+                st.session_state.revenue_details_a = {
+                    'fcr': annual_revenue_fcr,
+                    'afrr': annual_revenue_afrr,
+                    'arbitrage': annual_revenue_arb,
+                    'total_brutto': total_annual_revenue,
+                    'marketer_fee': marketer_fee,
+                    'total_netto': net_revenue
+                }
+
+                buy = arb_res['avg_buy_price']
+                sell = arb_res['avg_sell_price']
+                spread_text = (f"Ø Kauf {buy:.1f} €/MWh → Ø Verkauf {sell:.1f} €/MWh"
+                               if buy is not None and sell is not None else "kein Handel")
+                st.markdown(f"""
+                <div class="info-box">
+                    <strong>Berechnungsgrundlage:</strong><br>
+                    • Arbitrage mit {share_arbitrage*100:.0f}% des Speichers
+                      ({storage_power*share_arbitrage:.2f} MW / {storage_capacity*share_arbitrage:.2f} MWh)<br>
+                    • Optimaler Fahrplan: {arb_res['cycles_per_day']:.2f} Zyklen/Tag
+                      ({arb_res['cycles_per_year']:.0f}/Jahr), {spread_text}<br>
+                    • Day-Ahead-Erlös (perfekte Voraussicht): {arb_res['annual_revenue']:,.0f} €/Jahr,
+                      Intraday-Aufschlag: +{intraday_uplift*100:.0f}%<br>
+                    • FCR: {fcr_mean:.1f} €/MW/h × {storage_power*share_fcr:.2f} MW × 8.760 h &nbsp;|&nbsp;
+                      aFRR: {afrr_mean:.1f} €/MW/h × {storage_power*share_afrr:.2f} MW × 8.760 h
+                </div>
+                """, unsafe_allow_html=True)
+
     # Erlösübersicht anzeigen
     if st.session_state.get('revenue_details_a'):
         st.markdown("---")
@@ -1966,10 +1389,10 @@ def show_mode_a_step2():
         # Spezifische Kennzahlen
         col1, col2 = st.columns(2)
         with col1:
-            specific_revenue_mwh = rev['total_netto'] / (storage_capacity * 1000 if is_mw else storage_capacity)
+            specific_revenue_mwh = rev['total_netto'] / (storage_capacity * 1000)
             st.metric("Spezifischer Erlös", f"{specific_revenue_mwh:,.0f} €/kWh/Jahr")
         with col2:
-            specific_revenue_mw = rev['total_netto'] / (storage_power * 1000 if is_mw else storage_power)
+            specific_revenue_mw = rev['total_netto'] / (storage_power * 1000)
             st.metric("Spezifischer Erlös", f"{specific_revenue_mw:,.0f} €/kW/Jahr")
     
     st.markdown("---")
@@ -2071,29 +1494,15 @@ def show_mode_a_step3():
     # NPV berechnen
     npv = sum([cf / ((1 + discount_rate) ** i) for i, cf in enumerate(cashflows)])
     
-    # IRR berechnen (vereinfachte Newton-Methode)
-    def calc_npv(rate, cfs):
-        return sum([cf / ((1 + rate) ** i) for i, cf in enumerate(cfs)])
-    
-    irr = None
-    try:
-        # Bisection method für IRR
-        low, high = -0.5, 1.0
-        for _ in range(100):
-            mid = (low + high) / 2
-            if calc_npv(mid, cashflows) > 0:
-                low = mid
-            else:
-                high = mid
-        irr = mid
-    except:
-        irr = None
-    
+    # IRR berechnen (Bisektion; None, wenn kein Vorzeichenwechsel des Kapitalwerts existiert)
+    irr = sm.irr(cashflows)
+
     # Amortisation berechnen
     payback = None
     for i, cum_cf in enumerate(cumulative_cf):
-        if cum_cf >= 0:
-            payback = i
+        if cum_cf >= 0 and i > 0:
+            prev = cumulative_cf[i - 1]
+            payback = (i - 1) + (-prev / (cum_cf - prev) if cum_cf != prev else 0)
             break
     
     # LCOS berechnen (Levelized Cost of Storage)
@@ -2101,12 +1510,21 @@ def show_mode_a_step3():
     soc_max_val = st.session_state.get('soc_max_a_val', 0.90)
     usable_capacity_factor = soc_max_val - soc_min_val  # Nutzbare Kapazität (z.B. 0.8 = 80%)
     
-    total_energy_discharged = sum([storage_capacity * 1000 * usable_capacity_factor * 365 * 1.5 * ((1 - capacity_degradation) ** y) 
-                                   for y in range(calendar_life)])  # ~1.5 Zyklen/Tag, nutzbare Kapazität
-    total_costs_discounted = sum([(annual_opex) / ((1 + discount_rate) ** y) 
+    # Zyklen/Tag bezogen auf den gesamten Speicher (aus Schritt 2; nur der
+    # Arbitrage-Anteil zykelt nennenswert)
+    cycles_per_day = st.session_state.get('cycles_per_day_a', 1.5)
+    efficiency_a = st.session_state.get('efficiency_a_val', 0.9)
+
+    # Entladene Energie (MWh) je Jahr, mit Degradation; AC-seitig = nutzbare Kapazität × sqrt(η)
+    energy_per_year = [storage_capacity * usable_capacity_factor * np.sqrt(efficiency_a) * 365 * cycles_per_day
+                       * ((1 - capacity_degradation) ** (y - 1)) for y in range(1, calendar_life + 1)]
+    # LCOS = Barwert der Kosten / Barwert der entladenen Energie (beides diskontiert)
+    discounted_energy = sum([e / ((1 + discount_rate) ** y) for y, e in enumerate(energy_per_year, start=1)])
+    total_costs_discounted = sum([(annual_opex) / ((1 + discount_rate) ** y)
                                   for y in range(1, calendar_life + 1)]) + total_capex
-    lcos = total_costs_discounted / total_energy_discharged * 1000 if total_energy_discharged > 0 else 0
-    
+    lcos = total_costs_discounted / discounted_energy if discounted_energy > 0 else 0
+    total_cycles_lifetime = cycles_per_day * 365 * calendar_life
+
     # Ergebnisse anzeigen
     col1, col2, col3, col4 = st.columns(4)
     
@@ -2117,7 +1535,7 @@ def show_mode_a_step3():
                  delta_color=npv_color)
     
     with col2:
-        if irr:
+        if irr is not None:
             irr_delta = f"{(irr - discount_rate)*100:+.1f}% vs. WACC"
             st.metric("IRR (Interner Zinsfuß)", f"{irr*100:.1f}%", delta=irr_delta)
         else:
@@ -2125,20 +1543,27 @@ def show_mode_a_step3():
     
     with col3:
         if payback:
-            st.metric("Amortisation", f"{payback} Jahre",
+            st.metric("Amortisation", f"{payback:.1f} Jahre",
                      delta="OK" if payback <= calendar_life * 0.6 else "Langsam",
                      delta_color="normal" if payback <= calendar_life * 0.6 else "inverse")
         else:
             st.metric("Amortisation", f">{calendar_life} Jahre", delta="Nicht erreicht", delta_color="inverse")
     
     with col4:
-        st.metric("LCOS", f"{lcos:.1f} €/MWh", help="Levelized Cost of Storage")
+        st.metric("LCOS", f"{lcos:.1f} €/MWh",
+                  help="Levelized Cost of Storage: Barwert (CAPEX + OPEX) / Barwert der entladenen Energie. "
+                       "Ohne Kosten der Ladeenergie.")
+
+    st.caption(f"Annahme für LCOS: {cycles_per_day:.2f} Vollzyklen/Tag bezogen auf den gesamten Speicher "
+               f"→ ca. {total_cycles_lifetime:,.0f} Zyklen in {calendar_life} Jahren. "
+               "Bitte mit der Zyklenfestigkeit/Garantie des Herstellers abgleichen; "
+               "Ersatzinvestitionen (Augmentation) sind nicht enthalten.")
     
     # Bewertung
     st.markdown("---")
     st.markdown("#### 📋 Bewertung")
     
-    if npv > 0 and irr and irr > discount_rate and payback and payback <= calendar_life * 0.6:
+    if npv > 0 and irr is not None and irr > discount_rate and payback and payback <= calendar_life * 0.6:
         st.success("""
         ✅ **Investition empfohlen**
         
@@ -2301,7 +1726,7 @@ def show_mode_a_step3():
     ax1.bar(years, [cf/1000000 for cf in cumulative_cf], color=colors, alpha=0.7)
     ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
     if payback:
-        ax1.axvline(x=payback, color='#3498db', linestyle='--', label=f'Amortisation: {payback} Jahre')
+        ax1.axvline(x=payback, color='#3498db', linestyle='--', label=f'Amortisation: {payback:.1f} Jahre')
         ax1.legend()
     ax1.set_xlabel('Jahr')
     ax1.set_ylabel('Kumulierter Cashflow (Mio. €)')
@@ -2346,7 +1771,8 @@ def show_mode_a_step3():
             sensitivity_data['CAPEX'].append(sum([cf / ((1 + discount_rate) ** i) for i, cf in enumerate(adj_cfs)]))
             
             # Erlös-Sensitivität
-            adj_cfs = [cashflows[0]] + [cf * (1 + var/100) if cf > 0 else cf for cf in cashflows[1:]]
+            adj_cfs = [cashflows[0]] + [annual_revenues[i] * (1 + var/100) - annual_costs[i]
+                                        for i in range(1, len(annual_revenues))]
             sensitivity_data['Erlöse'].append(sum([cf / ((1 + discount_rate) ** i) for i, cf in enumerate(adj_cfs)]))
             
             # OPEX-Sensitivität
@@ -2400,9 +1826,10 @@ def show_mode_a_step3():
         'Erlöse': st.session_state.get('revenue_details_a', {}),
         'Wirtschaftlichkeit': {
             'NPV_EUR': npv,
-            'IRR_Prozent': irr * 100 if irr else None,
+            'IRR_Prozent': irr * 100 if irr is not None else None,
             'Amortisation_Jahre': payback,
             'LCOS_EUR_MWh': lcos,
+            'Zyklen_pro_Tag_Annahme': cycles_per_day,
             'Projektlaufzeit_Jahre': calendar_life,
             'Diskontierungszins_Prozent': discount_rate * 100,
         },
@@ -2502,6 +1929,8 @@ def show_mode_b_step1():
             key="has_pv_b",
             help="Aktivieren, wenn das Unternehmen eine eigene Photovoltaikanlage hat"
         )
+        # Unter eigenem Schlüssel merken – wird in den Schritten 2 und 4 gebraucht
+        st.session_state.has_pv_b_val = has_pv
     
     st.markdown("---")
     
@@ -2537,10 +1966,13 @@ def show_mode_b_step1():
                 st.session_state.load_profile = pd.Series(values, index=df.index)
                 
                 # Zeitauflösung erkennen und speichern
-                time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                time_res = detect_time_resolution(len(values), df.index)
                 st.session_state.time_resolution_b = time_res
-                
+
                 st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
+                if time_res.get('estimated'):
+                    st.warning("⚠️ Zeitauflösung konnte nicht aus Zeitstempeln bestimmt werden und wurde geschätzt. "
+                               "Bitte prüfen – sie bestimmt alle Energiemengen.")
                 
                 with st.expander("Lastprofil-Vorschau"):
                     fig, ax = plt.subplots(figsize=(10, 3))
@@ -2680,25 +2112,27 @@ def show_mode_b_step1():
                     pv_used = np.minimum(pv.values, load.values)
                     pv_curtailed = pv.values - pv_used
                     net_load = load.values - pv_used
-                    pv_surplus = np.zeros(len(load))  # Kein Überschuss für Speicher vom Netz
+                    # Der sonst abgeregelte PV-Überschuss steht dem Speicher als Ladequelle zur Verfügung
+                    pv_surplus = np.maximum(pv.values - load.values, 0)
                     
                     # Zeitauflösung verwenden
                     dt_b = st.session_state.get('time_resolution_b', {'dt': 0.25})['dt']
                     st.info(f"🔌 **Nulleinspeisung aktiv:** PV wird auf Eigenverbrauch begrenzt. "
-                           f"Abregelung: {pv_curtailed.sum() * dt_b / 1000:.1f} MWh/Jahr")
-                    
+                           f"Abregelung ohne Speicher: {pv_curtailed.sum() * dt_b:.1f} MWh")
+
                 elif feed_in_mode == "Begrenzte Einspeisung" and max_feed_in is not None:
                     # PV wird so begrenzt, dass Einspeisung max_feed_in nicht übersteigt
                     # Nettolast >= -max_feed_in
                     pv_used = np.minimum(pv.values, load.values + max_feed_in)
                     pv_curtailed = pv.values - pv_used
                     net_load = load.values - pv_used
-                    pv_surplus = np.maximum(pv_used - load.values, 0)
+                    # Gesamter PV-Überschuss (eingespeist + abgeregelt) kann den Speicher laden
+                    pv_surplus = np.maximum(pv.values - load.values, 0)
                     
                     # Zeitauflösung verwenden
                     dt_b = st.session_state.get('time_resolution_b', {'dt': 0.25})['dt']
                     st.info(f"🔌 **Einspeisebegrenzung aktiv:** Max. {max_feed_in*1000:.0f} kW Einspeisung. "
-                           f"Abregelung: {pv_curtailed.sum() * dt_b / 1000:.1f} MWh/Jahr")
+                           f"Abregelung ohne Speicher: {pv_curtailed.sum() * dt_b:.1f} MWh")
                 else:
                     # Unbegrenzt - Original-Logik
                     net_load = load.values - pv.values
@@ -2728,7 +2162,7 @@ def show_mode_b_step1():
                         max_einspeisung = abs(min(net_load.min(), 0))
                         st.metric("Max. Einspeisung", f"{max_einspeisung*1000:.0f} kW")
                     else:
-                        st.metric("PV-Abregelung", f"{pv_curtailed.sum() * dt_b:.0f} kWh")
+                        st.metric("PV-Abregelung", f"{pv_curtailed.sum() * dt_b:,.1f} MWh")
                 with col4:
                     total_pv_used = (pv.values - pv_curtailed).sum() * dt_b if feed_in_mode != "Unbegrenzt" else pv.sum() * dt_b
                     self_cons_rate = pv_self_consumption.sum() / total_pv_used * 100 / (1/dt_b) if total_pv_used > 0 else 0
@@ -2784,7 +2218,7 @@ def show_mode_b_step2():
     
     # Bruttolast und Nettolast
     load_brutto = st.session_state.load_profile
-    has_pv = st.session_state.get('has_pv_b', False)
+    has_pv = st.session_state.get('has_pv_b_val', False)
     pv_profile = st.session_state.get('pv_profile_b')
     
     if has_pv and pv_profile is not None:
@@ -2891,9 +2325,18 @@ def show_mode_b_step3():
     st.markdown("### Schritt 3: Zielwerte und Kosten festlegen")
     
     peak_load = st.session_state.peak_load
-    
+
+    # Untergrenze: mittlere (Netto-)Last – darunter reicht die Energie auch mit
+    # beliebig großem Speicher nicht.
+    base_load = st.session_state.get('net_load_b')
+    if base_load is None:
+        base_load = st.session_state.load_profile
+    min_limit_kw = float(np.clip(base_load.values, 0, None).mean() * 1000)
+    if min_limit_kw >= peak_load * 1000:
+        min_limit_kw = 0.0
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.markdown("#### 🎯 Ziel-Leistungsgrenze")
         
@@ -2901,9 +2344,9 @@ def show_mode_b_step3():
         
         target_limit = st.number_input(
             "Maximaler Netzbezug (kW)",
-            min_value=float(st.session_state.load_profile.mean() * 1000),
+            min_value=float(min_limit_kw),
             max_value=float(peak_load * 1000),
-            value=float(peak_load * 0.8 * 1000),
+            value=float(max(peak_load * 0.8 * 1000, min_limit_kw)),
             step=10.0,
             help="Auf welche Leistung soll der Bezug begrenzt werden?"
         ) / 1000  # Umrechnung in MW
@@ -3014,52 +2457,70 @@ def show_mode_b_step3():
 
 def show_mode_b_step4():
     """Modus B - Schritt 4: Speicherberechnung."""
-    
+
     st.markdown("### Schritt 4: Speicherdimensionierung für Peak Shaving")
-    
+
     # Nettolast verwenden wenn PV vorhanden
-    has_pv = st.session_state.get('has_pv_b', False)
+    has_pv = st.session_state.get('has_pv_b_val', False)
     pv_surplus = st.session_state.get('pv_surplus_b')
-    
+
     if has_pv and st.session_state.get('net_load_b') is not None:
         load = st.session_state.net_load_b
         st.info("📊 Berechnung basiert auf Nettolast (nach Abzug der PV-Erzeugung)")
     else:
         load = st.session_state.load_profile
         pv_surplus = None
-    
+
     target = st.session_state.target_limit
     peak = st.session_state.peak_load
     tech = st.session_state.technical_params
     econ = st.session_state.economic_params
     power_price = st.session_state.power_price
-    
+    energy_price = st.session_state.get('energy_price', 0.0)
+
+    time_res = get_time_resolution('time_resolution_b', len(load))
+    dt = time_res['dt']
+    steps_per_day = time_res['steps_per_day']
+    warn_if_not_full_year(len(load), dt)
+
     info_text = f"""
     <div class="info-box">
         <strong>Berechnungsgrundlage:</strong><br>
         Spitzenlast: {peak*1000:.0f} kW → Ziel: {target*1000:.0f} kW<br>
-        Erforderliche Reduktion: {(peak-target)*1000:.0f} kW
+        Erforderliche Reduktion: {(peak-target)*1000:.0f} kW<br>
+        Zeitauflösung: {time_res['resolution']}
     """
     if has_pv and pv_surplus is not None:
-        info_text += f"<br>PV-Überschuss wird zusätzlich im Speicher geladen."
+        info_text += "<br>PV-Überschuss kann den Speicher kostenlos laden."
     info_text += "</div>"
-    
+
     st.markdown(info_text, unsafe_allow_html=True)
-    
+
     st.markdown("---")
-    
+
     # Berechnungsmodus wählen
+    MODE_TARGET = "Zielgrenze einhalten (kostenminimal)"
+    MODE_ECON = "Wirtschaftliches Optimum"
+    MODE_PAYBACK = "Wunsch-Amortisation"
+
     st.markdown("#### 🎯 Berechnungsmodus")
     calc_mode = st.radio(
         "Wie soll die Speichergröße bestimmt werden?",
-        ["Optimale Größe für Zielgrenze", "Optimale Größe für Wunsch-Amortisation"],
+        [MODE_TARGET, MODE_ECON, MODE_PAYBACK],
         horizontal=True,
         key="calc_mode_b",
-        help="Wählen Sie, ob der Speicher für die gewählte Zielgrenze oder für eine bestimmte Amortisationszeit optimiert werden soll."
     )
-    
+
     target_payback = None
-    if calc_mode == "Optimale Größe für Wunsch-Amortisation":
+    if calc_mode == MODE_TARGET:
+        st.caption("Die Zielgrenze ist eine harte Nebenbedingung: Gesucht ist der günstigste Speicher "
+                   "(Leistung und Kapazität), der den Netzbezug in JEDEM Zeitschritt unter der Grenze hält.")
+    elif calc_mode == MODE_ECON:
+        st.caption("Die Jahresspitze ist selbst Optimierungsgröße: Das Modell wägt den eingesparten "
+                   f"Leistungspreis ({power_price:.0f} €/kW/a) gegen Annuität, OPEX und Verlustenergie ab "
+                   "und liefert die Speichergröße mit dem höchsten Kapitalwert. Die Zielgrenze aus Schritt 3 "
+                   "wird hier nicht verwendet.")
+    else:
         col1, col2 = st.columns(2)
         with col1:
             target_payback = st.number_input(
@@ -3068,295 +2529,188 @@ def show_mode_b_step4():
                 max_value=25,
                 value=10,
                 step=1,
-                help="Der Speicher wird so dimensioniert, dass er sich innerhalb dieser Zeit amortisiert."
+                help="Statische Amortisation: CAPEX / (Leistungspreis-Einsparung − OPEX − Verlustkosten)"
             )
         with col2:
-            st.info(f"🎯 Es wird die größtmögliche Speicherkonfiguration gesucht, "
-                   f"die sich innerhalb von {target_payback} Jahren amortisiert.")
-    
+            st.info(f"🎯 Gesucht wird die größte Spitzenreduktion (bis zur Zielgrenze {target*1000:.0f} kW), "
+                    f"die sich innerhalb von {target_payback} Jahren amortisiert. Für jede Stufe wird der "
+                    "kostenminimale Speicher berechnet.")
+
     st.markdown("---")
-    
-    # Berechnung starten
-    if calc_mode == "Optimale Größe für Zielgrenze":
-        button_text = "🔍 Speichergröße berechnen"
-    else:
-        button_text = f"🔍 Optimale Größe für {target_payback} Jahre Amortisation berechnen"
-    
+
+    common = dict(
+        load_profile=load,
+        dt=dt,
+        efficiency=tech['efficiency'],
+        soc_min=tech['soc_min'],
+        soc_max=tech['soc_max'],
+        capex_power=econ['capex_power'],
+        capex_energy=econ['capex_energy'],
+        interest_rate=econ['discount_rate'] / 100,
+        lifetime_years=econ['project_lifetime'],
+        opex_rate=econ['opex_rate'] / 100,
+        power_price=power_price,
+        energy_price=energy_price,
+        pv_surplus=pv_surplus,
+    )
+
+    def economics(res):
+        return sm.peak_shaving_economics(
+            res,
+            capex_power=econ['capex_power'],
+            capex_energy=econ['capex_energy'],
+            opex_rate=econ['opex_rate'] / 100,
+            power_price=power_price,
+            discount_rate=econ['discount_rate'] / 100,
+            lifetime_years=econ['project_lifetime'],
+        )
+
+    button_text = {
+        MODE_TARGET: "🔍 Speichergröße für Zielgrenze berechnen",
+        MODE_ECON: "🔍 Wirtschaftlich optimale Speichergröße berechnen",
+        MODE_PAYBACK: f"🔍 Größte Reduktion mit ≤ {target_payback} Jahren Amortisation berechnen",
+    }[calc_mode]
+
     if st.button(button_text, type="primary", use_container_width=True):
-        
-        if calc_mode == "Optimale Größe für Zielgrenze":
-            # Neue Logik: Einmalige PyPSA-Optimierung mit erweiterbarer Kapazität
-            st.info("⏳ Optimiere Speichergröße...")
-            progress_bar = st.progress(0.3, text="PyPSA-Optimierung läuft...")
-            
-            # Maximale Größe schätzen
-            max_power = (peak - target) / tech['efficiency'] * 1.5
-            max_capacity = max_power * 8  # Max E/P = 8h
-            
-            result = optimize_peak_shaving_storage(
-                load_profile=load,
-                target_limit=target,
-                efficiency=tech['efficiency'],
-                soc_min=tech['soc_min'],
-                soc_max=tech['soc_max'],
-                max_power_mw=max_power,
-                max_capacity_mwh=max_capacity,
-                pv_surplus=pv_surplus,
-                capex_power=econ['capex_power'],
-                capex_energy=econ['capex_energy'],
-                interest_rate=econ['discount_rate'] / 100,  # % zu Dezimal
-                lifetime_years=econ['project_lifetime'],
-                opex_rate=econ['opex_rate'] / 100,  # % zu Dezimal
-            )
-            
-            progress_bar.progress(1.0, text="✅ Fertig!")
-            
-            if result is None:
-                st.error("❌ PyPSA-Optimierung fehlgeschlagen. Bitte Parameter prüfen.")
-                return
-            
-            best_capacity = result['optimal_capacity_mwh']
-            required_power = result['optimal_power_mw']
-            best_result = result
-            
-            st.session_state.optimal_storage_size = best_capacity
-            st.session_state.optimal_power = required_power
-            st.session_state.peak_shaving_results = best_result
-            
-            st.success("✅ Berechnung abgeschlossen!")
-            
-            # Ergebnisse anzeigen
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Optimale Kapazität", f"{best_capacity*1000:.0f} kWh")
-            with col2:
-                st.metric("Optimale Leistung", f"{required_power*1000:.0f} kW")
-            with col3:
-                ep_ratio = best_capacity / required_power if required_power > 0 else 0
-                st.metric("E/P-Verhältnis", f"{ep_ratio:.1f} h")
-            with col4:
-                if best_result['target_achieved']:
-                    st.metric("Status", "✅ Ziel erreicht")
-                else:
-                    st.metric("Nicht gekappt", f"{best_result['unmet_peaks_count']} Zeitpunkte")
-        
+        best_result = None
+
+        if calc_mode in (MODE_TARGET, MODE_ECON):
+            with st.spinner("PyPSA-Optimierung läuft..."):
+                best_result = run_model(
+                    sm.optimize_peak_shaving_storage,
+                    target_limit=target if calc_mode == MODE_TARGET else None,
+                    **common,
+                )
+            if best_result is None and calc_mode == MODE_TARGET:
+                st.info("💡 Die Zielgrenze ist nicht erreichbar, wenn die Energie unterhalb der Grenze nicht "
+                        "ausreicht, um den Speicher wieder zu laden. Bitte eine höhere Zielgrenze wählen.")
+
         else:
-            # Neue Logik: Speicher für Wunsch-Amortisation
-            st.info("⏳ Die Optimierung kann einige Minuten dauern. Fortschritt wird unten angezeigt.")
-            
-            # Stop-Button über Session State
-            if 'stop_optimization' not in st.session_state:
-                st.session_state.stop_optimization = False
-            
-            stop_col1, stop_col2 = st.columns([3, 1])
-            with stop_col2:
-                if st.button("⏹️ Abbrechen", type="secondary", use_container_width=True):
-                    st.session_state.stop_optimization = True
-                    st.warning("Optimierung wird abgebrochen...")
-                    st.rerun()
-            
-            # Verschiedene Speichergrößen durchprobieren
-            results_list = []
-            
-            # Leistung variieren von 10% bis 100% der max. Reduktion
-            max_reduction = peak - target
-            
-            # Reduzierte Schrittzahl für schnellere Berechnung
-            power_steps = list(range(10, 101, 10))  # 10 Schritte statt 19
-            ep_ratios = np.arange(0.5, 4.1, 0.5)    # 8 Schritte statt 15
-            
-            total_iterations = len(power_steps) * len(ep_ratios)
+            # Spitzenreduktion stufenweise erhöhen; je Stufe kostenminimaler Speicher
+            reductions = np.linspace(0, peak - target, 13)[1:]
             progress_bar = st.progress(0, text="Starte Optimierung...")
-            status_text = st.empty()
-            
-            current_iteration = 0
-            
-            for power_pct in power_steps:
-                # Stop-Check
-                if st.session_state.get('stop_optimization', False):
-                    st.session_state.stop_optimization = False
-                    st.warning("⚠️ Optimierung abgebrochen!")
-                    break
-                
-                storage_power = max_reduction * power_pct / 100 / tech['efficiency']
-                
-                for ep_ratio in ep_ratios:
-                    current_iteration += 1
-                    progress = current_iteration / total_iterations
-                    progress_bar.progress(progress, text=f"Berechne... {current_iteration}/{total_iterations}")
-                    status_text.text(f"Teste: {storage_power*1000:.0f} kW, E/P={ep_ratio:.1f}h")
-                    
-                    storage_capacity = storage_power * ep_ratio
-                    
-                    result = calculate_peak_shaving(
-                        load_profile=load,
-                        target_limit=target,
-                        storage_power_mw=storage_power,
-                        storage_capacity_mwh=storage_capacity,
-                        efficiency=tech['efficiency'],
-                        soc_min=tech['soc_min'],
-                        soc_max=tech['soc_max'],
-                        pv_surplus=pv_surplus
-                    )
-                    
-                    # Wirtschaftlichkeit berechnen
-                    reduction_kw = result['peak_reduction_mw'] * 1000
-                    savings_per_year = reduction_kw * power_price
-                    
-                    capex = (storage_capacity * 1000 * econ['capex_energy'] + 
-                            storage_power * 1000 * econ['capex_power'])
-                    
-                    if savings_per_year > 0:
-                        payback = capex / savings_per_year
-                    else:
-                        payback = float('inf')
-                    
-                    results_list.append({
-                        'power_kw': storage_power * 1000,
-                        'capacity_kwh': storage_capacity * 1000,
-                        'ep_ratio': ep_ratio,
-                        'reduction_kw': reduction_kw,
-                        'savings_eur': savings_per_year,
-                        'capex_eur': capex,
-                        'payback_years': payback,
-                        'target_achieved': result['target_achieved'],
-                        'unmet_peaks': result['unmet_peaks_count'],
-                        'result': result
-                    })
-            
+            results_list = []
+
+            for i, reduction in enumerate(reductions, start=1):
+                progress_bar.progress(i / len(reductions),
+                                      text=f"Berechne Stufe {i}/{len(reductions)}: −{reduction*1000:.0f} kW")
+                try:
+                    res = sm.optimize_peak_shaving_storage(target_limit=peak - reduction, **common)
+                except sm.OptimizationError:
+                    break  # tiefere Stufen sind erst recht nicht erreichbar
+                eco = economics(res)
+                results_list.append({'result': res, 'econ': eco})
+
             progress_bar.progress(1.0, text="✅ Fertig!")
-            status_text.empty()
-            
-            # Filtern nach Amortisationsziel
-            valid_configs = [r for r in results_list 
-                            if r['payback_years'] <= target_payback and r['reduction_kw'] > 0]
-            
-            if valid_configs:
-                # Beste Konfiguration: Maximale Reduktion innerhalb Amortisationsziel
-                best_config = max(valid_configs, key=lambda x: x['reduction_kw'])
-                
-                st.success(f"✅ Optimale Konfiguration für {target_payback} Jahre Amortisation gefunden!")
-                
-                # Ergebnisse anzeigen
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Kapazität", f"{best_config['capacity_kwh']:.0f} kWh")
-                with col2:
-                    st.metric("Leistung", f"{best_config['power_kw']:.0f} kW")
-                with col3:
-                    st.metric("Peak-Reduktion", f"{best_config['reduction_kw']:.0f} kW")
-                with col4:
-                    st.metric("Amortisation", f"{best_config['payback_years']:.1f} Jahre")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("CAPEX", f"{best_config['capex_eur']:,.0f} €")
-                with col2:
-                    st.metric("Einsparung/Jahr", f"{best_config['savings_eur']:,.0f} €")
-                with col3:
-                    st.metric("E/P-Verhältnis", f"{best_config['ep_ratio']:.1f} h")
-                
-                # In Session State speichern
-                st.session_state.optimal_storage_size = best_config['capacity_kwh'] / 1000
-                st.session_state.optimal_power = best_config['power_kw'] / 1000
-                st.session_state.peak_shaving_results = best_config['result']
-                best_result = best_config['result']
-                best_capacity = best_config['capacity_kwh'] / 1000
-                required_power = best_config['power_kw'] / 1000
-                
-                # Vergleichstabelle anzeigen
-                with st.expander("📊 Alle Konfigurationen innerhalb Amortisationsziel"):
-                    df_valid = pd.DataFrame([{
-                        'Kapazität (kWh)': r['capacity_kwh'],
-                        'Leistung (kW)': r['power_kw'],
-                        'E/P (h)': r['ep_ratio'],
-                        'Reduktion (kW)': r['reduction_kw'],
-                        'Einsparung (€/a)': r['savings_eur'],
-                        'CAPEX (€)': r['capex_eur'],
-                        'Amortisation (a)': r['payback_years']
-                    } for r in sorted(valid_configs, key=lambda x: -x['reduction_kw'])[:20]])
-                    
-                    st.dataframe(df_valid, use_container_width=True)
-            
-            else:
-                st.error(f"❌ Keine Konfiguration erfüllt das Amortisationsziel von {target_payback} Jahren!")
-                
-                # Beste gefundene Konfiguration anzeigen
-                valid_any = [r for r in results_list if r['reduction_kw'] > 0]
-                if valid_any:
-                    best_found = min(valid_any, key=lambda x: x['payback_years'])
-                    
-                    st.warning(f"Beste gefundene Amortisation: **{best_found['payback_years']:.1f} Jahre**")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Kapazität", f"{best_found['capacity_kwh']:.0f} kWh")
-                    with col2:
-                        st.metric("Leistung", f"{best_found['power_kw']:.0f} kW")
-                    with col3:
-                        st.metric("Peak-Reduktion", f"{best_found['reduction_kw']:.0f} kW")
-                    
-                    st.info("💡 **Tipps zur Verbesserung:**\n"
-                           "- Höhere Zielgrenze wählen (geringere Reduktion, aber bessere Wirtschaftlichkeit)\n"
-                           "- Höheren Leistungspreis verhandeln\n"
-                           "- Günstigere Speicherkosten durch andere Technologie")
-                    
-                    # Trotzdem speichern für Visualisierung
-                    st.session_state.optimal_storage_size = best_found['capacity_kwh'] / 1000
-                    st.session_state.optimal_power = best_found['power_kw'] / 1000
-                    st.session_state.peak_shaving_results = best_found['result']
-                    best_result = best_found['result']
-                    best_capacity = best_found['capacity_kwh'] / 1000
-                    required_power = best_found['power_kw'] / 1000
+
+            if results_list:
+                table = pd.DataFrame([{
+                    'Neue Spitze (kW)': r['result']['new_peak_mw'] * 1000,
+                    'Reduktion (kW)': r['result']['peak_reduction_mw'] * 1000,
+                    'Leistung (kW)': r['result']['optimal_power_mw'] * 1000,
+                    'Kapazität (kWh)': r['result']['optimal_capacity_mwh'] * 1000,
+                    'CAPEX (€)': r['econ']['capex'],
+                    'Netto-Einsparung (€/a)': r['econ']['net_savings'],
+                    'Amortisation (a)': r['econ']['payback_years'],
+                    'NPV (€)': r['econ']['npv'],
+                } for r in results_list])
+
+                valid = [r for r in results_list if r['econ']['payback_years'] <= target_payback]
+                if valid:
+                    chosen = max(valid, key=lambda r: r['result']['peak_reduction_mw'])
+                    st.success(f"✅ Größte Reduktion mit ≤ {target_payback} Jahren Amortisation gefunden.")
                 else:
-                    st.error("Keine gültige Konfiguration gefunden. Bitte Parameter prüfen.")
-                    best_result = None
-        
-        # Visualisierung (für beide Modi)
-        if 'best_result' in dir() and best_result is not None:
+                    chosen = min(results_list, key=lambda r: r['econ']['payback_years'])
+                    st.error(f"❌ Keine Stufe erfüllt das Amortisationsziel von {target_payback} Jahren. "
+                             f"Beste gefundene Amortisation: {chosen['econ']['payback_years']:.1f} Jahre "
+                             "(wird unten dargestellt).")
+                    st.info("💡 Die Amortisation verbessert sich bei höherem Leistungspreis, niedrigeren "
+                            "Speicherkosten oder – oft am wirksamsten – bei einer weniger tiefen Kappung "
+                            "(seltene, kurze Spitzen sind am günstigsten zu kappen).")
+                best_result = chosen['result']
+
+                with st.expander("📊 Alle berechneten Stufen"):
+                    st.dataframe(table.round(1), use_container_width=True, hide_index=True)
+            else:
+                st.error("❌ Schon die kleinste Reduktionsstufe ist nicht erreichbar. Bitte Parameter prüfen.")
+
+        if best_result is not None:
+            st.session_state.optimal_storage_size = best_result['optimal_capacity_mwh']
+            st.session_state.optimal_power = best_result['optimal_power_mw']
+            st.session_state.peak_shaving_results = best_result
+            st.session_state.peak_shaving_econ = economics(best_result)
+            st.session_state.peak_shaving_mode = calc_mode
+
+    # Ergebnis anzeigen (bleibt auch nach einem Rerun sichtbar)
+    best_result = st.session_state.get('peak_shaving_results')
+    if best_result is not None:
+        eco = st.session_state.get('peak_shaving_econ') or economics(best_result)
+        best_capacity = best_result['optimal_capacity_mwh']
+        required_power = best_result['optimal_power_mw']
+
+        if required_power <= 0:
+            st.warning("⚠️ **Ergebnis: Kein Speicher wirtschaftlich.** Beim aktuellen Leistungspreis "
+                       "übersteigen die Speicherkosten die Einsparung für jede Größe.")
+        else:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Kapazität", f"{best_capacity*1000:,.0f} kWh")
+            with col2:
+                st.metric("Leistung", f"{required_power*1000:,.0f} kW")
+            with col3:
+                st.metric("E/P-Verhältnis", f"{best_result['ep_ratio']:.2f} h")
+            with col4:
+                st.metric("Neue Spitze", f"{best_result['new_peak_mw']*1000:,.0f} kW",
+                          delta=f"-{best_result['peak_reduction_mw']*1000:,.0f} kW", delta_color="inverse")
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("CAPEX", f"{eco['capex']:,.0f} €")
+            with col2:
+                st.metric("Netto-Einsparung", f"{eco['net_savings']:,.0f} €/a")
+            with col3:
+                payback_text = f"{eco['payback_years']:.1f} Jahre" if np.isfinite(eco['payback_years']) else "nie"
+                st.metric("Amortisation", payback_text)
+            with col4:
+                st.metric("Vollzyklen/Jahr", f"{best_result['cycles']:.0f}")
+
+            # Beispielwoche mit der höchsten Last
             st.markdown("---")
-            st.markdown("#### Beispielwoche mit Peak Shaving")
-            
-            # Eine Woche mit hoher Last finden
-            weekly_peaks = [load.iloc[i*672:(i+1)*672].max() for i in range(len(load)//672)]
-            peak_week = np.argmax(weekly_peaks)
-            start_idx = peak_week * 672
-            end_idx = min(start_idx + 672, len(load))
-            
+            st.markdown("#### Woche mit der höchsten Lastspitze")
+
+            steps_per_week = 7 * steps_per_day
+            n_weeks = max(len(load) // steps_per_week, 1)
+            weekly_peaks = [load.iloc[i*steps_per_week:(i+1)*steps_per_week].max() for i in range(n_weeks)]
+            start_idx = int(np.argmax(weekly_peaks)) * steps_per_week
+            end_idx = min(start_idx + steps_per_week, len(load))
+
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-            
-            x = range(end_idx - start_idx)
-            
-            # Original vs. gekappt
-            ax1.plot(x, load.iloc[start_idx:end_idx] * 1000, 
-                    label='Original', alpha=0.7, linewidth=1)
+            x = np.arange(end_idx - start_idx) * dt / 24  # Tage
+
+            ax1.plot(x, np.clip(load.values[start_idx:end_idx], 0, None) * 1000,
+                     label='Ohne Speicher', alpha=0.7, linewidth=1)
             ax1.plot(x, best_result['grid_power_profile'][start_idx:end_idx] * 1000,
-                    label='Mit Speicher', linewidth=1)
-            ax1.axhline(y=target * 1000, color='red', linestyle='--', 
-                       label=f'Zielgrenze: {target*1000:.0f} kW')
+                     label='Mit Speicher', linewidth=1)
+            ax1.axhline(y=best_result['new_peak_mw'] * 1000, color='red', linestyle='--',
+                        label=f"Neue Spitze: {best_result['new_peak_mw']*1000:.0f} kW")
             ax1.set_ylabel('Netzbezug (kW)')
             ax1.set_title('Lastprofil mit Peak Shaving')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
-            
-            # Speicher-SoC
-            ax2.fill_between(x, 
-                            best_result['soc_profile'][start_idx:end_idx] / best_capacity * 100,
-                            alpha=0.5, color='#3498db')
-            ax2.plot(x, best_result['soc_profile'][start_idx:end_idx] / best_capacity * 100,
-                    color='#2980b9')
+
+            soc_pct = best_result['soc_profile'][start_idx:end_idx] / best_capacity * 100
+            ax2.fill_between(x, soc_pct, alpha=0.5, color='#3498db')
+            ax2.plot(x, soc_pct, color='#2980b9')
             ax2.set_ylabel('Ladezustand (%)')
-            ax2.set_xlabel('Zeitschritt (15 min)')
+            ax2.set_xlabel('Tage')
             ax2.set_ylim(0, 100)
             ax2.grid(True, alpha=0.3)
-            
+
             st.pyplot(fig)
             plt.close()
-    
+
     st.markdown("---")
-    
+
     # Navigation
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
@@ -3384,24 +2738,30 @@ def show_mode_b_step5():
     econ = st.session_state.economic_params
     power_price = st.session_state.power_price
     
-    # Berechnungen
-    capex = capacity * 1000 * econ['capex_energy'] + power * 1000 * econ['capex_power']
-    opex = capex * econ['opex_rate'] / 100
-    
+    # Wirtschaftlichkeit (einheitlich im Rechenmodul)
+    eco = sm.peak_shaving_economics(
+        result,
+        capex_power=econ['capex_power'],
+        capex_energy=econ['capex_energy'],
+        opex_rate=econ['opex_rate'] / 100,
+        power_price=power_price,
+        discount_rate=econ['discount_rate'] / 100,
+        lifetime_years=econ['project_lifetime'],
+    )
+    capex = eco['capex']
+    opex = eco['opex']
+
     # Einsparung durch Leistungsreduktion
     old_peak_cost = peak * 1000 * power_price
     new_peak_cost = result['new_peak_mw'] * 1000 * power_price
-    annual_savings = old_peak_cost - new_peak_cost
-    
-    # Wirtschaftlichkeit
-    net_savings = annual_savings - opex
-    payback = capex / net_savings if net_savings > 0 else float('inf')
-    
-    # NPV
-    npv = -capex
-    for y in range(1, econ['project_lifetime'] + 1):
-        npv += net_savings / ((1 + econ['discount_rate']/100) ** y)
-    
+    annual_savings = eco['peak_savings']
+    # Mehrkosten Strombezug: Speicherverluste (abzgl. genutztem PV-Überschuss)
+    energy_cost = eco['energy_cost']
+
+    net_savings = eco['net_savings']
+    payback = eco['payback_years']
+    npv = eco['npv']
+
     st.markdown("---")
     
     st.markdown("## 📊 Ergebniszusammenfassung")
@@ -3453,6 +2813,7 @@ def show_mode_b_step5():
                 "Neue Leistungskosten",
                 "Brutto-Einsparung",
                 "Betriebskosten Speicher",
+                "Mehrkosten Strombezug (Verluste)",
                 "Netto-Einsparung",
                 "",
                 "Investitionskosten",
@@ -3464,6 +2825,7 @@ def show_mode_b_step5():
                 f"{new_peak_cost:,.0f} €/Jahr",
                 f"{annual_savings:,.0f} €/Jahr",
                 f"-{opex:,.0f} €/Jahr",
+                f"{-energy_cost:,.0f} €/Jahr",
                 f"{net_savings:,.0f} €/Jahr",
                 "",
                 f"{capex:,.0f} €",
@@ -3520,6 +2882,8 @@ def show_mode_b_step5():
         "wirtschaftlichkeit": {
             "investitionskosten_eur": capex,
             "jaehrliche_einsparung_eur": annual_savings,
+            "mehrkosten_strombezug_eur": energy_cost,
+            "betriebskosten_eur": opex,
             "netto_einsparung_eur": net_savings,
             "amortisation_jahre": payback,
             "npv_eur": npv,
@@ -3553,611 +2917,6 @@ def show_mode_b_step5():
 # =============================================================================
 # Modus C: NVP-Überbauung
 # =============================================================================
-
-def simulate_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_pv_inst_mw,
-                         storage_power_mw, storage_capacity_mwh, eta_charge=0.95, 
-                         eta_discharge=0.95, soc_min=0.0, soc_max=1.0,
-                         da_prices=None, price_threshold=None, discharge_strategy="immediate",
-                         time_resolution=None):
-    """
-    Simuliert den Speicherbetrieb bei NVP-Überbauung mit PyPSA.
-    
-    KORREKTES MODELL:
-    - EE-Erzeugung als negative Last (muss abgenommen werden)
-    - Netzeinspeisung begrenzt auf NVP (mit Erlös)
-    - Speicher (Store mit Links für Effizienz)
-    - Abregelung als Slack-Senke
-    
-    Args:
-        da_prices: Day-Ahead-Preise (€/MWh), optional
-        price_threshold: Nicht verwendet (PyPSA optimiert automatisch)
-        discharge_strategy: Nicht verwendet (PyPSA optimiert automatisch)
-        time_resolution: dict mit 'dt' und 'steps_per_day' (optional, wird automatisch erkannt)
-    
-    Returns:
-        dict mit Zeitreihen und Kennzahlen
-    """
-    n = len(wind_profile) if wind_profile is not None else len(pv_profile)
-    
-    # Zeitauflösung erkennen falls nicht übergeben
-    if time_resolution is None:
-        time_resolution = detect_time_resolution(n)
-    dt = time_resolution['dt']
-    
-    # Erzeugung berechnen
-    p_wind = wind_profile.values * p_wind_inst_mw if wind_profile is not None else np.zeros(n)
-    p_pv = pv_profile.values * p_pv_inst_mw if pv_profile is not None else np.zeros(n)
-    p_ee = p_wind + p_pv
-    
-    # Preise vorbereiten
-    if da_prices is not None and len(da_prices) >= n:
-        prices = da_prices.values[:n] if hasattr(da_prices, 'values') else np.array(da_prices[:n])
-        avg_price = np.mean(prices)
-    else:
-        prices = None
-        avg_price = 80
-    
-    # Nutzbare Kapazität
-    usable_capacity = storage_capacity_mwh * (soc_max - soc_min)
-    initial_soc = usable_capacity * 0.5
-    
-    # === PyPSA Netzwerk ===
-    network = pypsa.Network()
-    network.set_snapshots(range(n))
-    
-    # Zeitauflösung
-    network.snapshot_weightings.loc[:, "generators"] = dt
-    network.snapshot_weightings.loc[:, "stores"] = dt
-    network.snapshot_weightings.loc[:, "links"] = dt
-    
-    # === Hauptbus ===
-    network.add("Bus", "main")
-    
-    # === EE-Erzeugung als negative Last (MUSS abgenommen werden) ===
-    network.add("Load", "ee_generation",
-                bus="main",
-                p_set=-p_ee)  # Negativ = Einspeisung
-    
-    # === Netzeinspeisung (begrenzt auf NVP, mit Erlös) ===
-    network.add("Bus", "grid")
-    
-    # Generator am Grid-Bus als Senke
-    network.add("Generator", "grid_sink",
-                bus="grid",
-                p_nom=p_nvp_mw * 2,
-                p_min_pu=-1,
-                p_max_pu=0,
-                marginal_cost=0)
-    
-    if prices is not None:
-        network.add("Link", "grid_feed",
-                    bus0="main",
-                    bus1="grid",
-                    p_nom=p_nvp_mw,
-                    efficiency=1.0,
-                    marginal_cost=0)
-        network.links_t.marginal_cost = pd.DataFrame(
-            {"grid_feed": -prices},
-            index=network.snapshots
-        )
-    else:
-        network.add("Link", "grid_feed",
-                    bus0="main",
-                    bus1="grid",
-                    p_nom=p_nvp_mw,
-                    efficiency=1.0,
-                    marginal_cost=-avg_price)
-    
-    # === Speicher ===
-    network.add("Bus", "storage")
-    
-    network.add("Store", "battery",
-                bus="storage",
-                e_nom=usable_capacity,
-                e_initial=initial_soc,
-                e_cyclic=False,
-                standing_loss=0)
-    
-    # Laden: main -> storage
-    network.add("Link", "charge",
-                bus0="main",
-                bus1="storage",
-                p_nom=storage_power_mw,
-                efficiency=eta_charge,
-                marginal_cost=0.001)
-    
-    # Entladen: storage -> main
-    network.add("Link", "discharge",
-                bus0="storage",
-                bus1="main",
-                p_nom=storage_power_mw,
-                efficiency=eta_discharge,
-                marginal_cost=0)
-    
-    # === Abregelung (Senke ohne Erlös) ===
-    network.add("Bus", "curtail")
-    
-    network.add("Generator", "curtail_sink",
-                bus="curtail",
-                p_nom=p_ee.max() * 2,
-                p_min_pu=-1,
-                p_max_pu=0,
-                marginal_cost=0)
-    
-    network.add("Link", "curtailment",
-                bus0="main",
-                bus1="curtail",
-                p_nom=p_ee.max(),
-                efficiency=1.0,
-                marginal_cost=0.01)
-    
-    # === Optimieren ===
-    try:
-        status = network.optimize(solver_name="highs", solver_options={"threads": 1})
-        optimization_ok = status[0] == "ok"
-    except Exception as e:
-        st.error(f"❌ PyPSA-Optimierungsfehler: {e}")
-        return None
-    
-    if not optimization_ok:
-        st.error(f"❌ Optimierung nicht erfolgreich: {status}")
-        return None
-    
-    # === Ergebnisse extrahieren ===
-    p_grid = network.links_t.p0["grid_feed"].values
-    p_charge = network.links_t.p0["charge"].values
-    p_discharge_out = network.links_t.p1["discharge"].values
-    p_curtail = network.links_t.p0["curtailment"].values
-    soc = network.stores_t.e["battery"].values
-    
-    # Überschuss (Referenz)
-    p_surplus = np.maximum(p_ee - p_nvp_mw, 0)
-    
-    # SOC mit soc_min Offset
-    soc_absolute = soc + soc_min * storage_capacity_mwh
-    
-    # Erlös berechnen
-    if prices is not None:
-        discharge_revenue = p_grid * dt * prices
-        total_discharge_revenue = discharge_revenue.sum()
-        avg_discharge_price = total_discharge_revenue / (p_grid.sum() * dt) if p_grid.sum() > 0 else None
-    else:
-        discharge_revenue = np.zeros(n)
-        total_discharge_revenue = 0
-        avg_discharge_price = None
-    
-    # Kennzahlen berechnen
-    total_generation = p_ee.sum() * dt
-    total_surplus = p_surplus.sum() * dt
-    total_curtailment = p_curtail.sum() * dt
-    total_grid_feed = p_grid.sum() * dt
-    total_charged = p_charge.sum() * dt
-    total_discharged = p_discharge_out.sum() * dt
-    
-    # Netzauslastung
-    grid_utilization = total_grid_feed / (p_nvp_mw * n * dt) if p_nvp_mw > 0 else 0
-    
-    # Erfassungsgrad
-    capture_rate = min(total_charged / total_surplus, 1.0) if total_surplus > 0 else 1.0
-    
-    # Zyklen
-    cycles = total_discharged / storage_capacity_mwh if storage_capacity_mwh > 0 else 0
-    
-    return {
-        'p_ee': p_ee,
-        'p_grid': p_grid,
-        'p_charge': p_charge,
-        'p_discharge': p_discharge_out,
-        'p_curtail': p_curtail,
-        'p_surplus': p_surplus,
-        'soc': soc_absolute,
-        'prices': prices,
-        'discharge_revenue': discharge_revenue,
-        'total_generation_mwh': total_generation,
-        'total_surplus_mwh': total_surplus,
-        'total_curtailment_mwh': total_curtailment,
-        'total_grid_feed_mwh': total_grid_feed,
-        'total_charged_mwh': total_charged,
-        'total_discharged_mwh': total_discharged,
-        'total_discharge_revenue': total_discharge_revenue,
-        'avg_discharge_price': avg_discharge_price,
-        'grid_utilization': grid_utilization,
-        'capture_rate': capture_rate,
-        'cycles': cycles,
-        'optimization_status': 'optimal',
-        'objective_value': network.objective,
-    }
-
-
-def run_nvp_parameter_study(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_pv_inst_mw,
-                            power_range, duration_range, eta_charge=0.95, eta_discharge=0.95,
-                            da_prices=None, price_threshold=None, discharge_strategy="immediate"):
-    """
-    Führt eine Parameterstudie für verschiedene Speicherkonfigurationen durch.
-    
-    Args:
-        power_range: Liste von Speicherleistungen (relativ zu P_NVP, z.B. [0.1, 0.2, ...])
-        duration_range: Liste von Speicherdauern in Stunden
-        da_prices: Day-Ahead-Preise (optional)
-        price_threshold: Preis-Schwellwert oder Perzentil
-        discharge_strategy: Entladestrategie
-        
-    Returns:
-        DataFrame mit Ergebnissen für jede Kombination
-    """
-    results = []
-    
-    for power_ratio in power_range:
-        for duration in duration_range:
-            storage_power = p_nvp_mw * power_ratio
-            storage_capacity = storage_power * duration
-            
-            sim = simulate_nvp_storage(
-                wind_profile=wind_profile,
-                pv_profile=pv_profile,
-                p_nvp_mw=p_nvp_mw,
-                p_wind_inst_mw=p_wind_inst_mw,
-                p_pv_inst_mw=p_pv_inst_mw,
-                storage_power_mw=storage_power,
-                storage_capacity_mwh=storage_capacity,
-                eta_charge=eta_charge,
-                eta_discharge=eta_discharge,
-                da_prices=da_prices,
-                price_threshold=price_threshold,
-                discharge_strategy=discharge_strategy,
-            )
-            
-            result_entry = {
-                'power_ratio': power_ratio,
-                'duration_h': duration,
-                'storage_power_mw': storage_power,
-                'storage_capacity_mwh': storage_capacity,
-                'capture_rate': sim['capture_rate'],
-                'grid_utilization': sim['grid_utilization'],
-                'curtailment_mwh': sim['total_curtailment_mwh'],
-                'surplus_mwh': sim['total_surplus_mwh'],
-                'cycles': sim['cycles'],
-                'discharged_mwh': sim['total_discharged_mwh'],
-            }
-            
-            # Erlösdaten hinzufügen wenn Preise vorhanden
-            if da_prices is not None:
-                result_entry['discharge_revenue'] = sim['total_discharge_revenue']
-                result_entry['avg_discharge_price'] = sim['avg_discharge_price']
-            
-            results.append(result_entry)
-    
-    return pd.DataFrame(results)
-
-
-def optimize_nvp_storage(wind_profile, pv_profile, p_nvp_mw, p_wind_inst_mw, p_pv_inst_mw,
-                         max_storage_power_mw, max_storage_capacity_mwh,
-                         eta_charge=0.95, eta_discharge=0.95, soc_min=0.0, soc_max=1.0,
-                         da_prices=None, capex_power=80, capex_energy=250,
-                         interest_rate=0.05, lifetime_years=15,
-                         opex_rate=0.02, feed_in_value=80, time_resolution=None):
-    """
-    Optimiert Speicherleistung UND -kapazität für NVP-Überbauung.
-    
-    EINFACHES KORREKTES MODELL:
-    - Ein Hauptbus
-    - EE-Erzeugung muss verbraucht werden (als negative Last)
-    - Netzeinspeisung begrenzt auf NVP (Link mit Erlös)
-    - Speicher (Store mit Links für Effizienz)
-    - Abregelung (Link ohne Erlös)
-    
-    Wirtschaftliche Parameter:
-    - CAPEX: Investitionskosten (annualisiert)
-    - OPEX: Betriebskosten (% von CAPEX pro Jahr)
-    - Wert vermiedener Abregelung: feed_in_value (€/MWh)
-    
-    Args:
-        wind_profile: Normiertes Windprofil (0-1)
-        pv_profile: Normiertes PV-Profil (0-1)
-        p_nvp_mw: Netzverknüpfungspunkt-Leistung (MW)
-        p_wind_inst_mw: Installierte Windleistung (MW)
-        p_pv_inst_mw: Installierte PV-Leistung (MW)
-        max_storage_power_mw: Max. Speicherleistung für Optimierung (MW)
-        max_storage_capacity_mwh: Max. Speicherkapazität für Optimierung (MWh)
-        da_prices: Day-Ahead-Preise (€/MWh), optional
-        capex_power: CAPEX Leistung (€/kW)
-        capex_energy: CAPEX Energie (€/kWh)
-        interest_rate: Zinssatz für Annuität (z.B. 0.05 = 5%)
-        lifetime_years: Lebensdauer für Annuität (Jahre)
-        opex_rate: Betriebskosten als Anteil von CAPEX (z.B. 0.02 = 2%)
-        feed_in_value: Marktwert der Einspeisung / Wert vermiedener Abregelung (€/MWh)
-        time_resolution: dict mit 'dt' und 'steps_per_day' (optional)
-    
-    Returns:
-        dict mit optimaler Konfiguration und Ergebnissen
-    """
-    n = len(wind_profile) if wind_profile is not None else len(pv_profile)
-    
-    # Zeitauflösung erkennen falls nicht übergeben
-    if time_resolution is None:
-        time_resolution = detect_time_resolution(n)
-    dt = time_resolution['dt']
-    
-    # Erzeugung berechnen
-    p_wind = wind_profile.values * p_wind_inst_mw if wind_profile is not None else np.zeros(n)
-    p_pv = pv_profile.values * p_pv_inst_mw if pv_profile is not None else np.zeros(n)
-    p_ee = p_wind + p_pv
-    
-    # Preise vorbereiten
-    if da_prices is not None and len(da_prices) >= n:
-        prices = da_prices.values[:n] if hasattr(da_prices, 'values') else np.array(da_prices[:n])
-        # Bei DA-Preisen: Diese direkt verwenden
-        use_price_profile = True
-    else:
-        prices = None
-        # Ohne DA-Preise: Fester Marktwert verwenden
-        use_price_profile = False
-    
-    # Überschuss berechnen (Referenz für "ohne Speicher")
-    p_surplus = np.maximum(p_ee - p_nvp_mw, 0)
-    total_surplus_ref = p_surplus.sum() * dt
-    
-    # Referenz ohne Speicher
-    p_grid_no_storage = np.minimum(p_ee, p_nvp_mw)
-    total_grid_no_storage = p_grid_no_storage.sum() * dt
-    p_curtail_no_storage = p_ee - p_grid_no_storage
-    total_curtail_no_storage = p_curtail_no_storage.sum() * dt
-    
-    # Wenn kein Überschuss, brauchen wir keinen Speicher
-    if total_surplus_ref < 0.1:
-        return {
-            'optimal_capacity_mwh': 0,
-            'optimal_power_mw': 0,
-            'ep_ratio': 0,
-            'p_ee': p_ee,
-            'p_grid': p_grid_no_storage,
-            'p_charge': np.zeros(n),
-            'p_discharge': np.zeros(n),
-            'p_curtail': p_curtail_no_storage,
-            'p_surplus': p_surplus,
-            'soc': np.zeros(n),
-            'prices': prices,
-            'discharge_revenue': np.zeros(n),
-            'total_generation_mwh': p_ee.sum() * dt,
-            'total_surplus_mwh': total_surplus_ref,
-            'total_curtailment_mwh': total_curtail_no_storage,
-            'total_grid_feed_mwh': total_grid_no_storage,
-            'total_charged_mwh': 0,
-            'total_discharged_mwh': 0,
-            'total_discharge_revenue': 0,
-            'avg_discharge_price': None,
-            'grid_utilization': total_grid_no_storage / (p_nvp_mw * n * dt),
-            'capture_rate': 0,
-            'cycles': 0,
-            'optimization_status': 'no_surplus',
-            'objective_value': 0,
-            'ref_grid_feed_mwh': total_grid_no_storage,
-            'ref_curtailment_mwh': total_curtail_no_storage,
-        }
-    
-    # === Annuität berechnen (KORREKT!) ===
-    annuity_factor = calculate_annuity_factor(interest_rate, lifetime_years)
-    
-    # Jährliche Kapitalkosten pro Einheit (CAPEX annualisiert + OPEX)
-    annual_capex_energy = capex_energy * 1000 * annuity_factor  # €/MWh/Jahr
-    annual_opex_energy = capex_energy * 1000 * opex_rate        # €/MWh/Jahr
-    annual_cost_energy = annual_capex_energy + annual_opex_energy  # Gesamtkosten Energie
-    
-    annual_capex_power = capex_power * 1000 * annuity_factor    # €/MW/Jahr
-    annual_opex_power = capex_power * 1000 * opex_rate          # €/MW/Jahr
-    annual_cost_power = annual_capex_power + annual_opex_power  # Gesamtkosten Leistung
-    
-    # Nutzbare Kapazität (max)
-    max_usable_capacity = max_storage_capacity_mwh * (soc_max - soc_min)
-    
-    # === PyPSA Netzwerk ===
-    network = pypsa.Network()
-    network.set_snapshots(range(n))
-    
-    # Zeitauflösung setzen
-    network.snapshot_weightings.loc[:, "generators"] = dt
-    network.snapshot_weightings.loc[:, "stores"] = dt
-    network.snapshot_weightings.loc[:, "links"] = dt
-    
-    # === Hauptbus ===
-    network.add("Bus", "main")
-    
-    # === EE-Erzeugung als negative Last (MUSS abgenommen werden) ===
-    network.add("Load", "ee_generation",
-                bus="main",
-                p_set=-p_ee)  # Negativ = Einspeisung in den Bus
-    
-    # === Netzeinspeisung (Link zu Senke, begrenzt auf NVP, mit Erlös) ===
-    network.add("Bus", "grid")
-    
-    # Generator am Grid-Bus der unbegrenzt aufnehmen kann (= Netz)
-    network.add("Generator", "grid_sink",
-                bus="grid",
-                p_nom=p_nvp_mw * 2,  # Großzügig
-                p_min_pu=-1,  # Kann "negative" Leistung = aufnehmen
-                p_max_pu=0,   # Nimmt nur auf, erzeugt nicht
-                marginal_cost=0)
-    
-    # Link vom Hauptbus zum Grid (begrenzt auf NVP)
-    if use_price_profile and prices is not None:
-        network.add("Link", "grid_feed",
-                    bus0="main",
-                    bus1="grid",
-                    p_nom=p_nvp_mw,
-                    efficiency=1.0,
-                    marginal_cost=0)
-        # Zeitvariable negative Kosten = Erlös (DA-Preise)
-        network.links_t.marginal_cost = pd.DataFrame(
-            {"grid_feed": -prices},
-            index=network.snapshots
-        )
-    else:
-        # Ohne DA-Preise: Fester Marktwert der Einspeisung
-        network.add("Link", "grid_feed",
-                    bus0="main",
-                    bus1="grid",
-                    p_nom=p_nvp_mw,
-                    efficiency=1.0,
-                    marginal_cost=-feed_in_value)  # Wert der vermiedenen Abregelung
-    
-    # === Speicher ===
-    network.add("Bus", "storage")
-    
-    # Store
-    network.add("Store", "battery",
-                bus="storage",
-                e_nom=0,
-                e_nom_extendable=True,
-                e_nom_min=0,
-                e_nom_max=max_usable_capacity,
-                e_cyclic=False,
-                e_initial=0,
-                standing_loss=0,
-                capital_cost=annual_cost_energy)
-    
-    # Laden: main -> storage
-    network.add("Link", "charge",
-                bus0="main",
-                bus1="storage",
-                p_nom=0,
-                p_nom_extendable=True,
-                p_nom_min=0,
-                p_nom_max=max_storage_power_mw,
-                efficiency=eta_charge,
-                marginal_cost=0.001,
-                capital_cost=annual_cost_power / 2)
-    
-    # Entladen: storage -> main
-    network.add("Link", "discharge",
-                bus0="storage",
-                bus1="main",
-                p_nom=0,
-                p_nom_extendable=True,
-                p_nom_min=0,
-                p_nom_max=max_storage_power_mw,
-                efficiency=eta_discharge,
-                marginal_cost=0,
-                capital_cost=annual_cost_power / 2)
-    
-    # === Abregelung (Link zu Senke ohne Erlös) ===
-    network.add("Bus", "curtail")
-    
-    network.add("Generator", "curtail_sink",
-                bus="curtail",
-                p_nom=p_ee.max() * 2,
-                p_min_pu=-1,
-                p_max_pu=0,
-                marginal_cost=0)
-    
-    network.add("Link", "curtailment",
-                bus0="main",
-                bus1="curtail",
-                p_nom=p_ee.max(),
-                efficiency=1.0,
-                marginal_cost=0.01)  # Kleine Kosten = vermeiden
-    
-    # === Optimieren ===
-    try:
-        status = network.optimize(solver_name="highs", solver_options={"threads": 1})
-        optimization_ok = status[0] == "ok"
-    except Exception as e:
-        st.error(f"PyPSA Fehler: {e}")
-        return None
-    
-    if not optimization_ok:
-        st.error(f"Optimierung nicht erfolgreich: {status}")
-        return None
-    
-    # === Ergebnisse extrahieren ===
-    optimal_capacity = network.stores.loc["battery", "e_nom_opt"]
-    optimal_power_charge = network.links.loc["charge", "p_nom_opt"]
-    optimal_power_discharge = network.links.loc["discharge", "p_nom_opt"]
-    optimal_power = max(optimal_power_charge, optimal_power_discharge)
-    
-    # Kapazität zurückrechnen (inkl. SOC-Grenzen)
-    total_capacity = optimal_capacity / (soc_max - soc_min) if (soc_max - soc_min) > 0 else optimal_capacity
-    
-    # Zeitreihen
-    p_grid = network.links_t.p0["grid_feed"].values
-    p_charge = network.links_t.p0["charge"].values
-    p_discharge_out = network.links_t.p1["discharge"].values
-    p_curtail = network.links_t.p0["curtailment"].values
-    
-    # SOC
-    if optimal_capacity > 0:
-        soc = network.stores_t.e["battery"].values
-        soc_absolute = soc + soc_min * total_capacity
-    else:
-        soc_absolute = np.zeros(n)
-    
-    # Kennzahlen
-    total_generation = p_ee.sum() * dt
-    total_grid_feed = p_grid.sum() * dt
-    total_curtailment = p_curtail.sum() * dt
-    total_charged = p_charge.sum() * dt
-    total_discharged = p_discharge_out.sum() * dt
-    
-    # Erlös
-    if use_price_profile and prices is not None:
-        revenue_profile = p_grid * dt * prices
-        total_revenue = revenue_profile.sum()
-        avg_discharge_price = total_revenue / total_grid_feed if total_grid_feed > 0 else None
-    else:
-        revenue_profile = p_grid * dt * feed_in_value
-        total_revenue = revenue_profile.sum()
-        avg_discharge_price = feed_in_value
-    
-    # Netzauslastung
-    max_possible_feed = p_nvp_mw * n * dt
-    grid_utilization = total_grid_feed / max_possible_feed if max_possible_feed > 0 else 0
-    
-    # Erfassungsgrad (wie viel vom Überschuss wird gespeichert)
-    capture_rate = min(total_charged / total_surplus_ref, 1.0) if total_surplus_ref > 0 else 0
-    
-    # Zyklen
-    cycles = total_discharged / total_capacity if total_capacity > 0 else 0
-    
-    # E/P-Verhältnis
-    ep_ratio = total_capacity / optimal_power if optimal_power > 0 else 0
-    
-    return {
-        'optimal_capacity_mwh': total_capacity,
-        'optimal_power_mw': optimal_power,
-        'ep_ratio': ep_ratio,
-        'p_ee': p_ee,
-        'p_grid': p_grid,
-        'p_charge': p_charge,
-        'p_discharge': p_discharge_out,
-        'p_curtail': p_curtail,
-        'p_surplus': p_surplus,
-        'soc': soc_absolute,
-        'prices': prices,
-        'discharge_revenue': revenue_profile,
-        'total_generation_mwh': total_generation,
-        'total_surplus_mwh': total_surplus_ref,
-        'total_curtailment_mwh': total_curtailment,
-        'total_grid_feed_mwh': total_grid_feed,
-        'total_charged_mwh': total_charged,
-        'total_discharged_mwh': total_discharged,
-        'total_discharge_revenue': total_revenue,
-        'avg_discharge_price': avg_discharge_price,
-        'grid_utilization': grid_utilization,
-        'capture_rate': capture_rate,
-        'cycles': cycles,
-        'ref_grid_feed_mwh': total_grid_no_storage,
-        'ref_curtailment_mwh': total_curtail_no_storage,
-        'optimization_status': 'optimal',
-        'objective_value': network.objective,
-        # Wirtschaftliche Parameter
-        'annuity_factor': annuity_factor,
-        'annual_cost_energy': annual_cost_energy,
-        'annual_cost_power': annual_cost_power,
-        'annual_capex_energy': annual_capex_energy,
-        'annual_opex_energy': annual_opex_energy,
-        'feed_in_value': feed_in_value,
-        'opex_rate': opex_rate,
-    }
-
 
 def render_parameterstudy_advanced_plots(results_df, c_E, c_P, p_nvp_mw):
     """
@@ -4810,7 +3569,7 @@ def show_mode_c_step2():
         <ul>
             <li><strong>Windprofil</strong>: Normierte Zeitreihe (0-1) oder absolute Leistung</li>
             <li><strong>PV-Profil</strong>: Normierte Zeitreihe (0-1) oder absolute Leistung</li>
-            <li><strong>Day-Ahead-Preise</strong> (optional): Für preisoptimierte Entladung</li>
+            <li><strong>Day-Ahead-Preise</strong> (optional): Für preisoptimierten Betrieb</li>
         </ul>
         <p>Mindestens ein Erzeugungsprofil ist erforderlich.</p>
         <p><strong>Unterstützte Formate:</strong> CSV, Excel (.xlsx, .xls)</p>
@@ -4847,10 +3606,12 @@ def show_mode_c_step2():
                     st.session_state.wind_profile_c = pd.Series(values, index=df.index)
                     
                     # Zeitauflösung erkennen und speichern
-                    time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                    time_res = detect_time_resolution(len(values), df.index)
                     st.session_state.time_resolution_c = time_res
-                    
+
                     st.success(f"✓ {len(df)} Datenpunkte geladen ({time_res['resolution']})")
+                    if time_res.get('estimated'):
+                        st.warning("⚠️ Zeitauflösung wurde geschätzt (keine Zeitstempel erkannt). Bitte prüfen.")
                     
                     with st.expander("Vorschau"):
                         st.line_chart(st.session_state.wind_profile_c.iloc[:min(1000, len(df))])
@@ -4905,8 +3666,8 @@ def show_mode_c_step2():
                         }
                         
                         # Zeitauflösung erkennen
-                        if 'time_resolution_c' not in st.session_state:
-                            time_res = detect_time_resolution(len(values), df.index if hasattr(df.index, 'to_series') else None)
+                        if st.session_state.get('wind_profile_c') is None or 'time_resolution_c' not in st.session_state:
+                            time_res = detect_time_resolution(len(values), df.index)
                             st.session_state.time_resolution_c = time_res
                         else:
                             time_res = st.session_state.time_resolution_c
@@ -4916,14 +3677,22 @@ def show_mode_c_step2():
                 st.markdown("---")
             
             # Zusammenfassung der hochgeladenen Profile
-            loaded_profiles = st.session_state.get('pv_profiles_c', {})
+            valid_indices = {anlage['index'] for anlage in pv_anlagen}
+            st.session_state.pv_profiles_c = {k: v for k, v in st.session_state.pv_profiles_c.items()
+                                              if k in valid_indices}
+            loaded_profiles = st.session_state.pv_profiles_c
             if len(loaded_profiles) > 0:
                 st.markdown("##### ✓ Geladene PV-Profile")
                 for idx, data in loaded_profiles.items():
                     st.caption(f"• {data['name']}: {data['power_mw']:.1f} MW")
             
             # Kombination für Kompatibilität mit altem Code
-            if len(loaded_profiles) == len(pv_anlagen):
+            pv_lengths = {len(data['profile']) for data in loaded_profiles.values()}
+            if len(pv_lengths) > 1:
+                st.error(f"❌ Die PV-Profile haben unterschiedliche Längen ({sorted(pv_lengths)}). "
+                         "Bitte Profile mit gleicher Länge und Auflösung hochladen.")
+                st.session_state.pv_profile_c = None
+            elif len(loaded_profiles) == len(pv_anlagen):
                 # Alle Profile geladen - kombinieren
                 combined_pv = None
                 total_pv_power = 0
@@ -4950,107 +3719,75 @@ def show_mode_c_step2():
     
     st.markdown("---")
     
-    # Day-Ahead-Preise und Entladestrategie
-    st.markdown("#### 💰 Entladestrategie (optional)")
-    
+    # Day-Ahead-Preise
+    st.markdown("#### 💰 Day-Ahead-Preise (optional)")
+
     st.markdown("""
     <div class="info-box">
-        <strong>Preisoptimierte Entladung:</strong><br>
-        Optional können Day-Ahead-Preise hochgeladen werden, um die Entladung auf 
-        Zeiten mit hohen Strompreisen zu beschränken. Dies erhöht den Erlös pro entladener kWh.
+        <strong>Preisoptimierter Betrieb:</strong><br>
+        Ohne Preise wird jede eingespeiste MWh gleich bewertet – der Speicher verschiebt dann nur
+        Überschüsse oberhalb der NVP-Grenze. Mit Day-Ahead-Preisen optimiert das Modell zusätzlich,
+        <em>wann</em> eingespeist wird (hohe Preise) und speist bei negativen Preisen nicht ein.
+        Die Optimierung kennt alle Preise im Voraus (perfekte Voraussicht) – das Ergebnis ist deshalb
+        eine obere Schranke für den erzielbaren Erlös.
     </div>
     """, unsafe_allow_html=True)
-    
+
     use_price_optimization = st.checkbox(
-        "Preisoptimierte Entladung aktivieren",
+        "Day-Ahead-Preise verwenden",
         value=False,
         key="use_price_opt_c",
-        help="Speicher entlädt nur, wenn der Strompreis einen Schwellwert überschreitet"
+        help="Stündliche oder 15-min-Preise in €/MWh für denselben Zeitraum wie die Erzeugungsprofile"
     )
-    
+
     if use_price_optimization:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("##### 💶 Day-Ahead-Preise")
-            price_file = st.file_uploader(
-                "Day-Ahead-Preise hochladen",
-                type=['csv', 'xlsx', 'xls'],
-                key="price_upload_c",
-                help="Zeitreihe mit Strompreisen in €/MWh"
-            )
-            
-            if price_file is not None:
-                df = load_csv_file(price_file)
-                if df is not None:
-                    st.session_state.da_prices_c = df.iloc[:, 0]
-                    prices = df.iloc[:, 0]
-                    st.success(f"✓ {len(df)} Preisdaten geladen")
-                    
-                    col_s1, col_s2, col_s3 = st.columns(3)
-                    with col_s1:
-                        st.metric("Mittelwert", f"{prices.mean():.1f} €/MWh")
-                    with col_s2:
-                        st.metric("Minimum", f"{prices.min():.1f} €/MWh")
-                    with col_s3:
-                        st.metric("Maximum", f"{prices.max():.1f} €/MWh")
-        
-        with col2:
-            st.markdown("##### ⚙️ Entladestrategie")
-            
-            discharge_strategy = st.radio(
-                "Strategie wählen:",
-                ["price_threshold", "price_percentile"],
-                format_func=lambda x: "Fester Preis-Schwellwert" if x == "price_threshold" else "Tägliches Preis-Perzentil",
-                key="discharge_strategy_c",
-                help="Fester Schwellwert: Entladung nur wenn Preis > X €/MWh\nPerzentil: Entladung nur in den oberen X% des Tages"
-            )
-            
-            if discharge_strategy == "price_threshold":
-                price_threshold = st.number_input(
-                    "Preis-Schwellwert (€/MWh)",
-                    min_value=0.0,
-                    max_value=500.0,
-                    value=80.0,
-                    step=5.0,
-                    key="price_threshold_c",
-                    help="Entladung nur wenn Day-Ahead-Preis über diesem Wert"
-                )
-                st.session_state.price_threshold_c_val = price_threshold
-                st.session_state.discharge_strategy_c_val = "price_threshold"
-            else:
-                price_percentile = st.slider(
-                    "Preis-Perzentil (%)",
-                    min_value=50,
-                    max_value=95,
-                    value=70,
-                    step=5,
-                    key="price_percentile_c",
-                    help="Entladung nur in den oberen X% der Tagespreise (z.B. 70 = obere 30%)"
-                )
-                st.session_state.price_threshold_c_val = price_percentile
-                st.session_state.discharge_strategy_c_val = "price_percentile"
-            
-            # Visualisierung der Schwellwerte
-            if st.session_state.get('da_prices_c') is not None:
-                prices = st.session_state.da_prices_c
-                if discharge_strategy == "price_threshold":
-                    threshold = st.session_state.get('price_threshold_c_val', 80)
-                    hours_above = (prices >= threshold).sum() / 4  # Stunden
-                    pct_above = (prices >= threshold).mean() * 100
-                    st.info(f"📊 {hours_above:.0f} Stunden ({pct_above:.1f}%) über Schwellwert")
-                else:
-                    percentile = st.session_state.get('price_threshold_c_val', 70)
-                    threshold = np.percentile(prices, percentile)
-                    st.info(f"📊 Schwellwert entspricht ~{threshold:.1f} €/MWh (Durchschnitt)")
+        price_file = st.file_uploader(
+            "Day-Ahead-Preise hochladen",
+            type=['csv', 'xlsx', 'xls'],
+            key="price_upload_c",
+            help="Zeitreihe mit Strompreisen in €/MWh"
+        )
+
+        if price_file is not None:
+            df = load_csv_file(price_file)
+            if df is not None:
+                st.session_state.da_prices_c = df.iloc[:, 0]
+                prices = df.iloc[:, 0]
+                st.success(f"✓ {len(df)} Preisdaten geladen")
+
+                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                with col_s1:
+                    st.metric("Mittelwert", f"{prices.mean():.1f} €/MWh")
+                with col_s2:
+                    st.metric("Minimum", f"{prices.min():.1f} €/MWh")
+                with col_s3:
+                    st.metric("Maximum", f"{prices.max():.1f} €/MWh")
+                with col_s4:
+                    st.metric("Anteil negativer Preise", f"{(prices < 0).mean()*100:.1f}%")
     else:
         st.session_state.da_prices_c = None
-        st.session_state.discharge_strategy_c_val = "immediate"
-        st.session_state.price_threshold_c_val = None
-        st.info("ℹ️ Ohne Preisoptimierung: Speicher entlädt sofort bei freier Netzkapazität")
-    
+
+    # Konsistenz der Zeitreihen prüfen
+    profile_error = None
+    wind_c = st.session_state.get('wind_profile_c')
+    pv_c = st.session_state.get('pv_profile_c')
+    if wind_c is not None and pv_c is not None and len(wind_c) != len(pv_c):
+        profile_error = (f"Wind- und PV-Profil haben unterschiedliche Längen "
+                         f"({len(wind_c)} vs. {len(pv_c)} Datenpunkte).")
+    n_gen = len(wind_c) if wind_c is not None else (len(pv_c) if pv_c is not None else None)
+    da_c = st.session_state.get('da_prices_c')
+    if profile_error is None and n_gen is not None and da_c is not None:
+        if sm.align_to_length(da_c, n_gen) is None:
+            profile_error = (f"Die Preiszeitreihe ({len(da_c)} Werte) passt nicht zu den Erzeugungsprofilen "
+                             f"({n_gen} Werte). Erwartet wird dieselbe Länge oder ein ganzzahliges Verhältnis "
+                             "(z.B. stündliche Preise zu 15-min-Profilen).")
+        elif len(da_c) != n_gen:
+            st.info(f"ℹ️ Preise ({len(da_c)} Werte) werden auf die Auflösung der Erzeugung ({n_gen} Werte) umgerechnet.")
+    if profile_error:
+        st.error(f"❌ {profile_error}")
+
     st.markdown("---")
-    
+
     # Navigation
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
@@ -5070,7 +3807,9 @@ def show_mode_c_step2():
         needs_prices = st.session_state.get('use_price_opt_c', False)
         has_prices = st.session_state.get('da_prices_c') is not None
         
-        if (has_wind or has_pv) and all_pv_loaded and (not needs_prices or has_prices):
+        if profile_error:
+            st.warning("⚠️ Bitte zuerst die Zeitreihen korrigieren")
+        elif (has_wind or has_pv) and all_pv_loaded and (not needs_prices or has_prices):
             if st.button("Weiter →", type="primary", use_container_width=True):
                 st.session_state.current_step = 3
                 st.rerun()
@@ -5081,7 +3820,7 @@ def show_mode_c_step2():
                 missing = len(pv_anlagen) - len(pv_profiles)
                 st.warning(f"⚠️ Noch {missing} von {len(pv_anlagen)} PV-Profilen fehlen")
             elif needs_prices and not has_prices:
-                st.warning("⚠️ Bitte laden Sie Day-Ahead-Preise hoch oder deaktivieren Sie die Preisoptimierung")
+                st.warning("⚠️ Bitte laden Sie Day-Ahead-Preise hoch oder deaktivieren Sie die Option")
 
 
 def show_mode_c_step3():
@@ -5107,13 +3846,14 @@ def show_mode_c_step3():
     p_surplus = np.maximum(p_ee - p_nvp, 0)
     p_grid_no_storage = np.minimum(p_ee, p_nvp)
     
-    # Zeitauflösung erkennen
-    time_res = detect_time_resolution(n)
+    # Beim Upload (aus den Zeitstempeln) erkannte Zeitauflösung verwenden
+    time_res = get_time_resolution('time_resolution_c', n)
     dt = time_res['dt']
     steps_per_day = time_res['steps_per_day']
     
     # Info über erkannte Auflösung anzeigen
     st.info(f"📊 Erkannte Zeitauflösung: **{time_res['resolution']}** ({n:,} Datenpunkte, {steps_per_day} pro Tag)")
+    warn_if_not_full_year(n, dt)
     
     total_generation = p_ee.sum() * dt
     total_surplus = p_surplus.sum() * dt
@@ -5133,7 +3873,8 @@ def show_mode_c_step3():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Gesamterzeugung", f"{total_generation:,.0f} MWh")
+        st.metric("Gesamterzeugung", f"{total_generation:,.0f} MWh",
+                  help="Summe über den Datenzeitraum")
     with col2:
         st.metric("Netzeinspeisung", f"{total_grid:,.0f} MWh")
     with col3:
@@ -5237,193 +3978,155 @@ def show_mode_c_step3():
             st.rerun()
 
 
+def nvp_base_kwargs():
+    """Gemeinsame Eingangsdaten aller NVP-Rechnungen (Profile, Anlage, Speichertechnik)."""
+    wind = st.session_state.get('wind_profile_c')
+    pv = st.session_state.get('pv_profile_c')
+    n = len(wind) if wind is not None else len(pv)
+    time_res = get_time_resolution('time_resolution_c', n)
+    return dict(
+        wind_profile=wind,
+        pv_profile=pv,
+        p_nvp_mw=st.session_state.p_nvp_mw,
+        p_wind_inst_mw=st.session_state.p_wind_inst_mw,
+        p_pv_inst_mw=st.session_state.p_pv_inst_mw,
+        dt=time_res['dt'],
+        eta_charge=st.session_state.eta_charge,
+        eta_discharge=st.session_state.eta_discharge,
+        # SOC-Grenzen aus Schritt 1 (wurden früher nicht an die Rechnung übergeben)
+        soc_min=st.session_state.get('soc_min_c_val', 0.0),
+        soc_max=st.session_state.get('soc_max_c_val', 1.0),
+    )
+
+
 def show_mode_c_step4():
-    """Modus C - Schritt 4: Parameterstudie."""
-    
+    """Modus C - Schritt 4: Speicherdimensionierung."""
+
     st.markdown("### Schritt 4: Speicherdimensionierung")
-    
+
     # Auswahl: Automatische Optimierung oder Parameterstudie
     st.markdown("#### 🎯 Berechnungsmodus")
     calc_mode = st.radio(
         "Wie soll die optimale Speichergröße ermittelt werden?",
         [
-            "Automatische Optimierung (empfohlen)", 
+            "Automatische Optimierung (empfohlen)",
             "Manuelle Parameterstudie"
         ],
         horizontal=True,
         help="Die automatische Optimierung findet die optimale Speichergröße in einem Rechenlauf. "
              "Die Parameterstudie testet alle Kombinationen und zeigt eine Heatmap."
     )
-    
+
     st.markdown("---")
-    
+
+    da_prices = st.session_state.get('da_prices_c')
+    # Vorgabewerte aus Schritt 1
+    c_E = float(st.session_state.get('cost_energy', 165.0))  # €/kWh
+    c_P = float(st.session_state.get('cost_power', 170.0))   # €/kW
+    default_lifetime = int(st.session_state.get('project_lifetime_c_val', 15))
+    default_opex = float(st.session_state.get('opex_rate_c_val', 2.0))
+    default_rate = float(st.session_state.get('discount_rate_c_val', 6.0))
+
     if calc_mode == "Automatische Optimierung (empfohlen)":
         # === AUTOMATISCHE OPTIMIERUNG MIT PYPSA ===
         st.markdown("""
         <div class="info-box">
             <strong>Automatische Optimierung mit PyPSA</strong><br>
-            Das Tool findet in einem Rechenlauf die optimale Speichergröße, die:
-            <ul>
-                <li>Abregelung minimiert / Netzeinspeisung maximiert</li>
-                <li>Speicherkosten (CAPEX + OPEX) berücksichtigt</li>
-                <li>Die NVP-Grenze einhält</li>
-            </ul>
+            Leistung und Kapazität werden in einem Rechenlauf so bestimmt, dass der jährliche
+            Überschuss aus <em>Einspeiseerlös − Annuität − OPEX</em> maximal wird. Der Speicher wird
+            also genau so groß, wie sich die letzte kW/kWh noch selbst trägt – das kann auch 0 sein.
+            Der Speicher lädt ausschließlich aus der eigenen Erzeugung (kein Netzbezug).
         </div>
         """, unsafe_allow_html=True)
-        
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
-            st.markdown("##### Maximale Speichergröße")
+            st.markdown("##### Obergrenzen für die Optimierung")
             max_power_pct = st.slider("Max. Leistung (% von NVP)", 50, 200, 100,
-                                      help="Obergrenze für die Optimierung")
-            max_duration = st.slider("Max. Speicherdauer (h)", 4, 24, 8,
-                                    help="Maximales E/P-Verhältnis")
-        
+                                      help="Obergrenze der Speicherleistung")
+            max_duration = st.slider("Max. Kapazität (h bei max. Leistung)", 4, 24, 8,
+                                    help="Obergrenze der Kapazität = max. Leistung × diese Dauer")
+
         with col2:
             st.markdown("##### Kostenparameter (aus Schritt 1)")
-            # Werte aus Session State holen
-            capex_energy = st.session_state.get('cost_energy', 200)
-            capex_power = st.session_state.get('cost_power', 80)
-            
-            st.info(f"**CAPEX Energie:** {capex_energy} €/kWh\n\n"
-                   f"**CAPEX Leistung:** {capex_power} €/kW")
-            
+            capex_energy = c_E
+            capex_power = c_P
+
+            st.info(f"**CAPEX Energie:** {capex_energy:.0f} €/kWh\n\n"
+                   f"**CAPEX Leistung:** {capex_power:.0f} €/kW")
+
             if st.checkbox("Werte anpassen?", key="adjust_capex"):
-                capex_energy = st.number_input("CAPEX Energie (€/kWh)", 100, 500, capex_energy)
-                capex_power = st.number_input("CAPEX Leistung (€/kW)", 50, 200, capex_power)
-        
-        # Annuitätsparameter
+                capex_energy = st.number_input("CAPEX Energie (€/kWh)", 20.0, 1000.0, capex_energy, 5.0)
+                capex_power = st.number_input("CAPEX Leistung (€/kW)", 0.0, 1000.0, capex_power, 5.0)
+
         st.markdown("##### Wirtschaftliche Parameter")
-        
+
         col1, col2 = st.columns(2)
         with col1:
-            interest_rate = st.slider("Kalkulationszinssatz (%)", 1, 10, 5, 
-                                     help="Zinssatz für die Annuitätenberechnung") / 100
-            lifetime_years = st.slider("Speicher-Lebensdauer (Jahre)", 10, 25, 15,
-                                      help="Wirtschaftliche Nutzungsdauer")
+            interest_rate = st.number_input("Kalkulationszinssatz (%)", 0.0, 15.0, default_rate, 0.5,
+                                            key="interest_auto_c",
+                                            help="Zinssatz für die Annuitätenberechnung") / 100
+            lifetime_years = st.number_input("Speicher-Lebensdauer (Jahre)", 5, 30, default_lifetime,
+                                             key="lifetime_auto_c",
+                                             help="Wirtschaftliche Nutzungsdauer")
         with col2:
-            opex_rate = st.slider("OPEX (% von CAPEX/Jahr)", 0, 5, 2,
-                                 help="Jährliche Betriebskosten als Anteil der Investition") / 100
-            
-            # Marktwert der Einspeisung / Wert vermiedener Abregelung
-            da_prices = st.session_state.get('da_prices_c')
+            opex_rate = st.number_input("OPEX (% von CAPEX/Jahr)", 0.0, 5.0, default_opex, 0.5,
+                                        key="opex_auto_c",
+                                        help="Jährliche Betriebskosten als Anteil der Investition") / 100
+
             if da_prices is not None:
-                avg_market_price = da_prices.mean()
-                st.info(f"Ø Day-Ahead-Preis: {avg_market_price:.1f} €/MWh (aus Upload)")
-                feed_in_value = avg_market_price
+                feed_in_value = float(da_prices.mean())
+                st.info(f"Einspeisung wird mit den Day-Ahead-Preisen bewertet "
+                        f"(Ø {feed_in_value:.1f} €/MWh, aus Upload)")
             else:
                 feed_in_value = st.number_input(
                     "Marktwert Einspeisung (€/MWh)",
-                    min_value=20,
-                    max_value=200,
-                    value=80,
-                    help="Wert der vermiedenen Abregelung = Erlös pro eingespeister MWh"
+                    min_value=0.0,
+                    max_value=500.0,
+                    value=80.0,
+                    step=5.0,
+                    help="Erlös pro eingespeister MWh (z.B. anzulegender Wert oder Marktwert)"
                 )
-        
-        # Annuitätenfaktor und Gesamtkosten anzeigen
-        anf = (interest_rate * (1 + interest_rate) ** lifetime_years) / ((1 + interest_rate) ** lifetime_years - 1)
-        annual_capex = capex_energy * anf
-        annual_opex = capex_energy * opex_rate
-        annual_total = annual_capex + annual_opex
-        
-        st.caption(f"**Jährliche Kosten pro kWh:** CAPEX {annual_capex:.1f} €/kWh/a + OPEX {annual_opex:.1f} €/kWh/a = **{annual_total:.1f} €/kWh/a**")
-        st.caption(f"**Marktwert Einspeisung:** {feed_in_value:.0f} €/MWh")
-        
+
+        anf = sm.annuity_factor(interest_rate, lifetime_years)
+        st.caption(f"**Jährliche Kosten:** {capex_energy * (anf + opex_rate):.1f} €/kWh/a "
+                   f"+ {capex_power * (anf + opex_rate):.1f} €/kW/a "
+                   f"(Annuitätenfaktor {anf:.4f} + OPEX {opex_rate*100:.1f} %)")
+
         st.markdown("---")
-        
+
         if st.button("🚀 Optimierung starten", type="primary", use_container_width=True):
-            
+
             p_nvp = st.session_state.p_nvp_mw
             max_power_mw = p_nvp * max_power_pct / 100
             max_capacity_mwh = max_power_mw * max_duration
-            
-            st.info("⏳ PyPSA-Optimierung läuft... (ca. 30-60 Sekunden)")
-            progress_bar = st.progress(0.3, text="Optimiere Speichergröße...")
-            
-            # Preisparameter abrufen
-            da_prices = st.session_state.get('da_prices_c')
-            
-            result = optimize_nvp_storage(
-                wind_profile=st.session_state.get('wind_profile_c'),
-                pv_profile=st.session_state.get('pv_profile_c'),
-                p_nvp_mw=p_nvp,
-                p_wind_inst_mw=st.session_state.p_wind_inst_mw,
-                p_pv_inst_mw=st.session_state.p_pv_inst_mw,
-                max_storage_power_mw=max_power_mw,
-                max_storage_capacity_mwh=max_capacity_mwh,
-                eta_charge=st.session_state.eta_charge,
-                eta_discharge=st.session_state.eta_discharge,
-                da_prices=da_prices,
-                capex_power=capex_power,
-                capex_energy=capex_energy,
-                interest_rate=interest_rate,
-                lifetime_years=lifetime_years,
-                opex_rate=opex_rate,
-                feed_in_value=feed_in_value,
-            )
-            
-            progress_bar.progress(1.0, text="✅ Fertig!")
-            
+
+            with st.spinner("PyPSA-Optimierung läuft... (je nach Datenmenge bis zu einer Minute)"):
+                result = run_model(
+                    sm.optimize_nvp_storage,
+                    **nvp_base_kwargs(),
+                    max_storage_power_mw=max_power_mw,
+                    max_storage_capacity_mwh=max_capacity_mwh,
+                    da_prices=da_prices,
+                    capex_power=capex_power,
+                    capex_energy=capex_energy,
+                    interest_rate=interest_rate,
+                    lifetime_years=lifetime_years,
+                    opex_rate=opex_rate,
+                    feed_in_value=feed_in_value,
+                )
+
             if result is None:
-                st.error("❌ Optimierung fehlgeschlagen. Bitte Parameterstudie verwenden.")
-            elif result['optimal_power_mw'] < 0.001:
-                # Spezialfall: Optimum ist 0 Speicher
-                st.warning("⚠️ **Ergebnis: Kein Speicher wirtschaftlich sinnvoll**")
-                
-                st.markdown(f"""
-                <div class="info-box">
-                    <strong>Warum?</strong><br>
-                    Bei nur <strong>{result['total_surplus_mwh']:.0f} MWh</strong> Überschuss pro Jahr 
-                    übersteigen die Speicherkosten den Nutzen.<br><br>
-                    <strong>Jährliche Kapitalkosten:</strong> {result.get('annual_cost_energy', 0):.0f} €/MWh/Jahr<br>
-                    <strong>Überschuss ohne Speicher:</strong> {result.get('ref_curtailment_mwh', result['total_curtailment_mwh']):.0f} MWh/Jahr<br>
-                    <strong>Netzauslastung ohne Speicher:</strong> {result['grid_utilization']*100:.1f}%
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.info("💡 **Optionen:**\n"
-                       "- Niedrigere CAPEX-Annahmen testen\n"
-                       "- Längere Lebensdauer oder niedrigeren Zinssatz wählen\n"
-                       "- Manuelle Parameterstudie durchführen\n"
-                       "- Höhere Überbauung (mehr installierte Leistung) prüfen")
-                
-                # Trotzdem speichern für Konsistenz
-                st.session_state.optimal_nvp_result = result
+                st.error("❌ Optimierung fehlgeschlagen.")
             else:
-                st.success("✅ Optimale Speichergröße gefunden!")
-                
-                # Ergebnisse anzeigen
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Optimale Leistung", f"{result['optimal_power_mw']*1000:.0f} kW",
-                             delta=f"{result['optimal_power_mw']/p_nvp*100:.0f}% von NVP")
-                with col2:
-                    st.metric("Optimale Kapazität", f"{result['optimal_capacity_mwh']*1000:.0f} kWh")
-                with col3:
-                    st.metric("E/P-Verhältnis", f"{result['ep_ratio']:.1f} h")
-                with col4:
-                    st.metric("Erfassungsgrad", f"{result['capture_rate']*100:.1f}%")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Netzauslastung", f"{result['grid_utilization']*100:.1f}%")
-                with col2:
-                    st.metric("Abregelung", f"{result['total_curtailment_mwh']:.0f} MWh/Jahr")
-                with col3:
-                    st.metric("Zyklen/Jahr", f"{result['cycles']:.0f}")
-                
-                # CAPEX berechnen
-                total_capex = (result['optimal_capacity_mwh'] * 1000 * capex_energy + 
-                              result['optimal_power_mw'] * 1000 * capex_power)
-                st.info(f"💰 Geschätzte Investitionskosten: **{total_capex:,.0f} €**")
-                
-                # In Session State speichern für Schritt 5
                 st.session_state.optimal_nvp_result = result
                 st.session_state.nvp_capex_params = {'energy': capex_energy, 'power': capex_power}
-                
-                # Auch als "beste Konfiguration" für Kompatibilität
+                st.session_state.nvp_econ = sm.nvp_economics(
+                    result, capex_power, capex_energy, opex_rate, interest_rate, lifetime_years)
+                st.session_state.nvp_limits = {'power': max_power_mw, 'capacity': max_capacity_mwh}
+                # Ergebnisse der Parameterstudie verwerfen, damit Schritt 5 eindeutig ist
+                st.session_state.parameter_study_results = None
                 st.session_state.selected_config = {
                     'power_ratio': result['optimal_power_mw'] / p_nvp,
                     'duration_h': result['ep_ratio'],
@@ -5432,182 +4135,224 @@ def show_mode_c_step4():
                     'capture_rate': result['capture_rate'],
                     'grid_utilization': result['grid_utilization'],
                 }
-        
+
+        result = st.session_state.get('optimal_nvp_result')
+        if result is not None:
+            p_nvp = st.session_state.p_nvp_mw
+            eco = st.session_state.get('nvp_econ')
+            limits = st.session_state.get('nvp_limits', {})
+
+            if result['optimal_power_mw'] <= 0:
+                st.warning("⚠️ **Ergebnis: Kein Speicher wirtschaftlich sinnvoll**")
+                st.markdown(f"""
+                <div class="info-box">
+                    <strong>Warum?</strong><br>
+                    Bei <strong>{result['total_surplus_mwh']:,.0f} MWh</strong> Überschuss im Datenzeitraum
+                    deckt der Mehrerlös die Speicherkosten für keine Größe.<br><br>
+                    <strong>Abregelung ohne Speicher:</strong> {result['ref_curtailment_mwh']:,.0f} MWh<br>
+                    <strong>Netzauslastung ohne Speicher:</strong> {result['grid_utilization']*100:.1f}%
+                </div>
+                """, unsafe_allow_html=True)
+                st.info("💡 **Optionen:**\n"
+                       "- Niedrigere CAPEX-Annahmen oder längere Lebensdauer testen\n"
+                       "- Day-Ahead-Preise hochladen (Preisspreads erhöhen den Speicherwert)\n"
+                       "- Manuelle Parameterstudie durchführen\n"
+                       "- Höhere Überbauung (mehr installierte Leistung) prüfen")
+            else:
+                st.success("✅ Optimale Speichergröße gefunden!")
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Optimale Leistung", f"{result['optimal_power_mw']*1000:,.0f} kW",
+                             delta=f"{result['optimal_power_mw']/p_nvp*100:.0f}% von NVP")
+                with col2:
+                    st.metric("Optimale Kapazität", f"{result['optimal_capacity_mwh']*1000:,.0f} kWh")
+                with col3:
+                    st.metric("E/P-Verhältnis", f"{result['ep_ratio']:.1f} h")
+                with col4:
+                    st.metric("Erfassungsgrad", f"{result['capture_rate']*100:.1f}%")
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Netzauslastung", f"{result['grid_utilization']*100:.1f}%")
+                with col2:
+                    st.metric("Zusätzliche Einspeisung", f"{result['additional_feed_in_mwh']:,.0f} MWh/a")
+                with col3:
+                    st.metric("Vollzyklen/Jahr", f"{result['cycles']:.0f}")
+                with col4:
+                    if eco is not None:
+                        st.metric("Kapitalwert (NPV)", f"{eco['npv']:,.0f} €")
+
+                if eco is not None:
+                    st.info(f"💰 Investitionskosten: **{eco['capex']:,.0f} €**")
+
+                # Hinweis, wenn eine Obergrenze das Ergebnis bestimmt
+                at_power = limits.get('power') and result['optimal_power_mw'] >= limits['power'] * 0.999
+                at_capacity = limits.get('capacity') and result['optimal_capacity_mwh'] >= limits['capacity'] * 0.999
+                if at_power or at_capacity:
+                    which = " und ".join([t for t, hit in (("Leistung", at_power), ("Kapazität", at_capacity)) if hit])
+                    st.warning(f"⚠️ Das Ergebnis liegt an der gesetzten Obergrenze ({which}). "
+                               "Das wirtschaftliche Optimum liegt vermutlich darüber – Obergrenze erhöhen und neu rechnen.")
+
         st.markdown("---")
-        
-        # Weiter Button
+
         if st.session_state.get('optimal_nvp_result') is not None:
             if st.button("Weiter zu Ergebnissen →", type="primary", use_container_width=True):
                 st.session_state.current_step = 5
                 st.rerun()
-    
+
     else:  # Manuelle Parameterstudie
-        # === MANUELLE PARAMETERSTUDIE (wie bisher) ===
         st.markdown("""
         <div class="info-box">
-            Das Tool variiert systematisch Speicherleistung und -kapazität und berechnet 
-            für jede Kombination den Erfassungsgrad (wie viel Überschuss genutzt wird) 
-            und die resultierende Netzauslastung.
+            Das Tool variiert systematisch Speicherleistung und -kapazität und berechnet
+            für jede Kombination den Erfassungsgrad (wie viel Überschuss genutzt wird),
+            die resultierende Netzauslastung und die Wirtschaftlichkeit.
         </div>
         """, unsafe_allow_html=True)
-        
-        # Parameter für Studie
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.markdown("#### Speicherleistung")
-            power_min = st.slider("Min. Leistung (% von NVP)", 0, 50, 10)
+            power_min = st.slider("Min. Leistung (% von NVP)", 5, 50, 10)
             power_max = st.slider("Max. Leistung (% von NVP)", 50, 150, 100)
             power_steps = st.number_input("Anzahl Schritte (Leistung)", 3, 20, 5,
                                          help="Mehr Schritte = feinere Auflösung, aber längere Rechenzeit")
-        
+
         with col2:
             st.markdown("#### Speicherdauer (E/P)")
             duration_min = st.slider("Min. Dauer (h)", 1, 5, 1)
             duration_max = st.slider("Max. Dauer (h)", 5, 20, 8)
             duration_steps = st.number_input("Anzahl Schritte (Dauer)", 3, 20, 4,
                                             help="Mehr Schritte = feinere Auflösung, aber längere Rechenzeit")
-        
+
         total_combinations = int(power_steps) * int(duration_steps)
-        
-        # Warnung je nach Anzahl Kombinationen
+
         if total_combinations <= 25:
-            st.success(f"✓ {total_combinations} Kombinationen – schnelle Berechnung (< 2 Minuten)")
-        elif total_combinations <= 50:
-            st.info(f"ℹ️ {total_combinations} Kombinationen – ca. {total_combinations * 2 // 60} - {total_combinations * 3 // 60 + 1} Minuten")
+            st.success(f"✓ {total_combinations} Kombinationen – je Kombination ein Optimierungslauf (wenige Minuten)")
         elif total_combinations <= 100:
-            st.warning(f"⚠️ {total_combinations} Kombinationen – ca. {total_combinations * 2 // 60} - {total_combinations * 3 // 60 + 1} Minuten")
+            st.warning(f"⚠️ {total_combinations} Kombinationen – längere Rechenzeit (je Kombination ein Optimierungslauf)")
         else:
-            st.error(f"🔴 {total_combinations} Kombinationen – lange Rechenzeit (> {total_combinations * 2 // 60} Minuten). Schritte reduzieren empfohlen.")
-        
+            st.error(f"🔴 {total_combinations} Kombinationen – sehr lange Rechenzeit. Schritte reduzieren empfohlen.")
+
         st.markdown("---")
-        
+
         # === WIRTSCHAFTLICHE PARAMETER ===
         st.markdown("#### 💰 Wirtschaftliche Parameter")
-        
+
         with st.expander("ℹ️ Erläuterung zur Wirtschaftlichkeitsbewertung", expanded=False):
             st.markdown("""
-            **Erlösmodell:** Der Speicher ermöglicht zusätzliche Netzeinspeisung, die sonst abgeregelt würde.
-            
-            **Jährlicher Erlös** = Zusätzliche Einspeisung × Strompreis
-            
-            **NPV (Kapitalwert)** = Σ (Erlös - Kosten) / (1+r)^t
-            - NPV > 0: Investition wirtschaftlich
-            - NPV < 0: Investition unwirtschaftlich
-            
-            **Break-Even-Preis** = Mindest-Strompreis für NPV = 0
+            **Erlösmodell:** Verglichen wird der Park MIT und OHNE Speicher.
+
+            **Jährlicher Mehrerlös** = Einspeiseerlös mit Speicher − Einspeiseerlös ohne Speicher
+            (tatsächlich zusätzlich eingespeiste Energie *nach* Speicherverlusten, bewertet zum jeweiligen Preis)
+
+            **NPV (Kapitalwert)** = −CAPEX + Σ (Mehrerlös − OPEX) / (1+r)^t
+
+            **Break-Even-Preis** = mittleres Preisniveau, ab dem NPV = 0  
+            (bei festem Preis: (Annuität + OPEX) / zusätzlich eingespeiste MWh; mit Day-Ahead-Preisen:
+            mittlerer Preis × Jahreskosten / Mehrerlös)
+
+            **LCOS** = (Annuität + OPEX) / jährlich entladene MWh (ohne Kosten der Ladeenergie)
             """)
-        
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             project_lifetime_ps = st.number_input(
-                "Projektlaufzeit (Jahre)", 
-                min_value=5, max_value=25, value=15,
+                "Projektlaufzeit (Jahre)",
+                min_value=5, max_value=30, value=default_lifetime,
                 key="lifetime_ps",
                 help="Kalkulatorische Nutzungsdauer des Speichers"
             )
-            
+
             discount_rate_ps = st.number_input(
-                "Kalkulationszins (%)", 
-                min_value=1.0, max_value=15.0, value=6.0, step=0.5,
+                "Kalkulationszins (%)",
+                min_value=0.0, max_value=15.0, value=default_rate, step=0.5,
                 key="discount_ps",
                 help="Gewichteter Kapitalkostensatz (WACC)"
             ) / 100
-        
+
         with col2:
             opex_rate_ps = st.number_input(
-                "OPEX (% von CAPEX/Jahr)", 
-                min_value=0.5, max_value=5.0, value=2.0, step=0.5,
+                "OPEX (% von CAPEX/Jahr)",
+                min_value=0.0, max_value=5.0, value=default_opex, step=0.5,
                 key="opex_ps",
                 help="Jährliche Betriebskosten als Prozentsatz der Investition"
             ) / 100
-            
-            # Strompreis-Option
-            da_prices_available = st.session_state.get('da_prices_c') is not None
-            
-            if da_prices_available:
+
+            if da_prices is not None:
                 price_source = st.radio(
-                    "Strompreis für Erlösrechnung:",
-                    ["Fester Durchschnittspreis", "Aus Day-Ahead-Preisen"],
+                    "Strompreis für Betrieb und Erlösrechnung:",
+                    ["Aus Day-Ahead-Preisen", "Fester Durchschnittspreis"],
                     horizontal=True,
                     key="price_source_ps",
-                    help="Day-Ahead: Verwendet die hochgeladenen Preise für realistische Erlösschätzung"
+                    help="Day-Ahead: Der Speicher wird preisoptimiert betrieben und die Einspeisung "
+                         "viertelstunden-/stundenscharf bewertet."
                 )
             else:
                 price_source = "Fester Durchschnittspreis"
                 st.caption("ℹ️ Day-Ahead-Preise nicht hochgeladen – fester Preis wird verwendet")
-        
-        # Strompreis-Eingabe
+
         if price_source == "Fester Durchschnittspreis":
             electricity_price = st.number_input(
                 "Strompreis (€/MWh)",
-                min_value=20.0, max_value=300.0, value=80.0, step=5.0,
+                min_value=0.0, max_value=500.0, value=80.0, step=5.0,
                 key="elec_price_ps",
                 help="Durchschnittlicher Verkaufspreis für eingespeisten Strom"
             )
             use_da_prices_for_revenue = False
         else:
-            da_prices = st.session_state.get('da_prices_c')
-            avg_price = da_prices.mean() if da_prices is not None else 80
-            st.info(f"📊 Day-Ahead-Preise: Ø {avg_price:.1f} €/MWh (Min: {da_prices.min():.1f}, Max: {da_prices.max():.1f})")
-            electricity_price = avg_price  # Fallback für Break-Even-Berechnung
+            electricity_price = float(da_prices.mean())
+            st.info(f"📊 Day-Ahead-Preise: Ø {electricity_price:.1f} €/MWh "
+                    f"(Min: {da_prices.min():.1f}, Max: {da_prices.max():.1f})")
             use_da_prices_for_revenue = True
-        
-        # Kostenparameter aus Session State
-        c_E = st.session_state.get('cost_energy', 165)  # €/kWh
-        c_P = st.session_state.get('cost_power', 170)   # €/kW
-        
+
         st.caption(f"💶 Kostenmodell: {c_E:.0f} €/kWh + {c_P:.0f} €/kW (aus Schritt 1)")
-        
-        # Annuitätenfaktor berechnen
-        annuity_factor = calculate_annuity_factor(discount_rate_ps, project_lifetime_ps)
-        
+
         st.markdown("---")
-        
+
         if st.button("🔍 Parameterstudie starten", type="primary", use_container_width=True):
-            
+
             power_range = np.linspace(power_min/100, power_max/100, int(power_steps))
             duration_range = np.linspace(duration_min, duration_max, int(duration_steps))
-            
-            # Preisparameter abrufen
-            da_prices = st.session_state.get('da_prices_c')
-            discharge_strategy = st.session_state.get('discharge_strategy_c_val', 'immediate')
-            price_threshold = st.session_state.get('price_threshold_c_val')
-            
-            # Fortschrittsanzeige
+
             progress_bar = st.progress(0, text="Starte Parameterstudie...")
             status_text = st.empty()
-            
+
+            base_kwargs = nvp_base_kwargs()
             results_list = []
             total = len(power_range) * len(duration_range)
             current = 0
-            
+            failed = False
+
             for power_ratio in power_range:
+                if failed:
+                    break
                 for duration in duration_range:
                     current += 1
                     progress_bar.progress(current / total, text=f"Berechne {current}/{total}...")
-                    status_text.text(f"Leistung: {power_ratio*100:.0f}%, Dauer: {duration:.0f}h")
-                    
+                    status_text.text(f"Leistung: {power_ratio*100:.0f}%, Dauer: {duration:.1f}h")
+
                     storage_power = st.session_state.p_nvp_mw * power_ratio
                     storage_capacity = storage_power * duration
-                    
-                    sim = simulate_nvp_storage(
-                        wind_profile=st.session_state.get('wind_profile_c'),
-                        pv_profile=st.session_state.get('pv_profile_c'),
-                        p_nvp_mw=st.session_state.p_nvp_mw,
-                        p_wind_inst_mw=st.session_state.p_wind_inst_mw,
-                        p_pv_inst_mw=st.session_state.p_pv_inst_mw,
+
+                    sim = run_model(
+                        sm.simulate_nvp_storage,
+                        **base_kwargs,
                         storage_power_mw=storage_power,
                         storage_capacity_mwh=storage_capacity,
-                        eta_charge=st.session_state.eta_charge,
-                        eta_discharge=st.session_state.eta_discharge,
-                        da_prices=da_prices,
-                        price_threshold=price_threshold,
-                        discharge_strategy=discharge_strategy,
+                        da_prices=da_prices if use_da_prices_for_revenue else None,
+                        feed_in_value=electricity_price,
                     )
-                    
-                    result_entry = {
+                    if sim is None:
+                        failed = True
+                        break
+
+                    # Wirtschaftlichkeit: Mehrerlös gegenüber dem Betrieb ohne Speicher
+                    eco = sm.nvp_economics(sim, c_P, c_E, opex_rate_ps, discount_rate_ps, project_lifetime_ps)
+
+                    results_list.append({
                         'power_ratio': power_ratio,
                         'duration_h': duration,
                         'storage_power_mw': storage_power,
@@ -5618,206 +4363,128 @@ def show_mode_c_step4():
                         'surplus_mwh': sim['total_surplus_mwh'],
                         'cycles': sim['cycles'],
                         'discharged_mwh': sim['total_discharged_mwh'],
-                    }
-                    
-                    # === WIRTSCHAFTLICHKEITSBERECHNUNG ===
-                    # CAPEX berechnen (c_E in €/kWh, c_P in €/kW)
-                    capex = (c_E * storage_capacity * 1000) + (c_P * storage_power * 1000)  # €
-                    
-                    # Jährlicher OPEX
-                    annual_opex = capex * opex_rate_ps
-                    
-                    # Zusätzliche Einspeisung (= vermiedene Abregelung)
-                    # Überschuss ohne Speicher = surplus_mwh
-                    # Abregelung mit Speicher = curtailment_mwh
-                    additional_feed_in = sim['total_surplus_mwh'] - sim['total_curtailment_mwh']
-                    
-                    # Jährlicher Erlös
-                    if use_da_prices_for_revenue and da_prices is not None:
-                        # Bei DA-Preisen: verwende den durchschnittlichen Entladepreis
-                        avg_price = sim.get('avg_discharge_price', electricity_price)
-                        if avg_price is None or avg_price == 0:
-                            avg_price = electricity_price
-                        annual_revenue = additional_feed_in * avg_price
-                    else:
-                        # Fester Strompreis
-                        annual_revenue = additional_feed_in * electricity_price
-                        avg_price = electricity_price
-                    
-                    # Jährliche Annuität der Investition
-                    annual_capex = capex * annuity_factor
-                    
-                    # Jährlicher Netto-Cashflow
-                    annual_net_cashflow = annual_revenue - annual_capex - annual_opex
-                    
-                    # NPV berechnen (vereinfacht: gleiche Cashflows über Laufzeit)
-                    # NPV = -CAPEX + Σ (Erlös - OPEX) / (1+r)^t
-                    npv = -capex
-                    for year in range(1, project_lifetime_ps + 1):
-                        npv += (annual_revenue - annual_opex) / ((1 + discount_rate_ps) ** year)
-                    
-                    # Break-Even-Preis berechnen (welcher Strompreis für NPV = 0?)
-                    # NPV = 0 => -CAPEX + Σ (p_be * additional_feed_in - OPEX) / (1+r)^t = 0
-                    # => p_be = (CAPEX * ANF + OPEX) / additional_feed_in
-                    if additional_feed_in > 0:
-                        total_annual_cost = annual_capex + annual_opex
-                        break_even_price = total_annual_cost / additional_feed_in
-                    else:
-                        break_even_price = float('inf')
-                    
-                    # Amortisationszeit (einfach)
-                    if annual_revenue > annual_opex:
-                        payback_years = capex / (annual_revenue - annual_opex)
-                    else:
-                        payback_years = float('inf')
-                    
-                    # LCOS (Levelized Cost of Storage)
-                    if sim['total_discharged_mwh'] > 0:
-                        # LCOS = Gesamtkosten / Gesamte entladene Energie über Laufzeit
-                        total_costs = capex + annual_opex * project_lifetime_ps
-                        total_discharged = sim['total_discharged_mwh'] * project_lifetime_ps
-                        lcos = total_costs / total_discharged
-                    else:
-                        lcos = float('inf')
-                    
-                    result_entry['capex'] = capex
-                    result_entry['annual_revenue'] = annual_revenue
-                    result_entry['annual_opex'] = annual_opex
-                    result_entry['npv'] = npv
-                    result_entry['break_even_price'] = break_even_price
-                    result_entry['payback_years'] = payback_years
-                    result_entry['lcos'] = lcos
-                    result_entry['additional_feed_in'] = additional_feed_in
-                    result_entry['avg_price_used'] = avg_price
-                    
-                    if da_prices is not None:
-                        result_entry['discharge_revenue'] = sim.get('total_discharge_revenue', 0)
-                        result_entry['avg_discharge_price'] = sim.get('avg_discharge_price')
-                    
-                    results_list.append(result_entry)
-            
-            progress_bar.progress(1.0, text="✅ Fertig!")
+                        'capex': eco['capex'],
+                        'annual_revenue': eco['annual_revenue'],
+                        'annual_opex': eco['annual_opex'],
+                        'npv': eco['npv'],
+                        'break_even_price': eco['break_even_price'],
+                        'payback_years': eco['payback_years'],
+                        'lcos': eco['lcos'],
+                        'additional_feed_in': eco['additional_feed_in'],
+                        'avg_price_used': eco['avg_price_used'],
+                    })
+
             status_text.empty()
-            
-            results = pd.DataFrame(results_list)
-            st.session_state.parameter_study_results = results
-            
-            st.success("✅ Parameterstudie abgeschlossen!")
-            
-            # Info zur Entladestrategie
-            if discharge_strategy != "immediate" and da_prices is not None:
-                if discharge_strategy == "price_threshold":
-                    st.info(f"💰 Preisoptimierte Entladung aktiv: Schwellwert {price_threshold:.0f} €/MWh")
-                else:
-                    st.info(f"💰 Preisoptimierte Entladung aktiv: Obere {100-price_threshold:.0f}% der Tagespreise")
-            
+
+            if failed or not results_list:
+                progress_bar.empty()
+                st.error("❌ Parameterstudie abgebrochen.")
+            else:
+                progress_bar.progress(1.0, text="✅ Fertig!")
+                st.session_state.parameter_study_results = pd.DataFrame(results_list)
+                # Ergebnis der automatischen Optimierung verwerfen, damit Schritt 5 eindeutig ist
+                st.session_state.optimal_nvp_result = None
+                st.session_state.nvp_sim_cache = None
+                st.session_state.economic_params_ps = {
+                    'electricity_price': electricity_price,
+                    'project_lifetime': project_lifetime_ps,
+                    'discount_rate': discount_rate_ps,
+                    'opex_rate': opex_rate_ps,
+                    'use_da_prices': use_da_prices_for_revenue,
+                    'c_E': c_E,
+                    'c_P': c_P,
+                }
+                st.success("✅ Parameterstudie abgeschlossen!")
+
+        results = st.session_state.get('parameter_study_results')
+        eco_ps = st.session_state.get('economic_params_ps')
+        if results is not None and eco_ps is not None:
             # Heatmap des Erfassungsgrades
             st.markdown("#### 📊 Erfassungsgrad (Anteil genutzter Überschuss)")
-            
-            # Pivot-Tabelle für Heatmap
+
             pivot = results.pivot_table(
-                values='capture_rate', 
-                index='duration_h', 
+                values='capture_rate',
+                index='duration_h',
                 columns='power_ratio',
                 aggfunc='mean'
             )
-            
+
             fig, ax = plt.subplots(figsize=(12, 8))
-            
-            im = ax.imshow(pivot.values * 100, aspect='auto', cmap='RdYlGn', 
+
+            im = ax.imshow(pivot.values * 100, aspect='auto', cmap='RdYlGn',
                           origin='lower', vmin=0, vmax=100)
-            
+
             ax.set_xticks(range(len(pivot.columns)))
             ax.set_xticklabels([f'{x*100:.0f}%' for x in pivot.columns])
             ax.set_yticks(range(len(pivot.index)))
-            ax.set_yticklabels([f'{y:.0f}h' for y in pivot.index])
-            
+            ax.set_yticklabels([f'{y:.1f}h' for y in pivot.index])
+
             ax.set_xlabel('Speicherleistung (% von NVP)')
             ax.set_ylabel('Speicherdauer (E/P)')
             ax.set_title('Erfassungsgrad des Überschusses (%)')
-            
+
             plt.colorbar(im, ax=ax, label='Erfassungsgrad (%)')
-            
-            # Werte in Zellen anzeigen
+
             for i in range(len(pivot.index)):
                 for j in range(len(pivot.columns)):
-                    text = ax.text(j, i, f'{pivot.values[i, j]*100:.0f}%',
-                                  ha='center', va='center', color='black', fontsize=8)
-            
+                    ax.text(j, i, f'{pivot.values[i, j]*100:.0f}%',
+                            ha='center', va='center', color='black', fontsize=8)
+
             st.pyplot(fig)
             plt.close()
-            
-            # Erweiterte Visualisierungen (P-E-Raum und Pareto-Kurve)
+
             st.markdown("---")
-            
-            # Kostenparameter aus Session State holen
-            c_E = st.session_state.get('cost_energy', 165)  # €/kWh
-            c_P = st.session_state.get('cost_power', 170)   # €/kW
-            p_nvp = st.session_state.get('p_nvp_mw', 50)    # MW
-            
-            render_parameterstudy_advanced_plots(results, c_E, c_P, p_nvp)
-            
+
+            render_parameterstudy_advanced_plots(results, eco_ps['c_E'], eco_ps['c_P'],
+                                                 st.session_state.get('p_nvp_mw', 50))
+
             st.markdown("---")
-            
-            # Wirtschaftlichkeitsbewertung
+
             render_economic_evaluation_plot(
-                results, 
-                electricity_price=electricity_price,
-                project_lifetime=project_lifetime_ps,
-                discount_rate=discount_rate_ps
+                results,
+                electricity_price=eco_ps['electricity_price'],
+                project_lifetime=eco_ps['project_lifetime'],
+                discount_rate=eco_ps['discount_rate']
             )
-            
+
             st.markdown("---")
-            
-            # Tabelle mit besten Konfigurationen (erweitert um wirtschaftliche Kennzahlen)
+
             st.markdown("#### 🏆 Top 5 Konfigurationen")
-            
-            # Tabs für verschiedene Sortierungen
+
             tab1, tab2 = st.tabs(["Nach Erfassungsgrad", "Nach NPV"])
-            
+
             with tab1:
                 top5_eta = results.nlargest(5, 'capture_rate')[
-                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h', 
+                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h',
                      'capture_rate', 'npv', 'break_even_price', 'cycles']
                 ].copy()
-                
-                top5_eta.columns = ['P (MW)', 'E (MWh)', 'E/P (h)', 
+
+                top5_eta.columns = ['P (MW)', 'E (MWh)', 'E/P (h)',
                                'Erfassung', 'NPV (€)', 'Break-Even (€/MWh)', 'Zyklen']
                 top5_eta['Erfassung'] = top5_eta['Erfassung'].apply(lambda x: f'{x*100:.1f}%')
-                top5_eta['NPV (€)'] = top5_eta['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.' if x > -1e9 else '—')
+                top5_eta['NPV (€)'] = top5_eta['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.')
                 top5_eta['Break-Even (€/MWh)'] = top5_eta['Break-Even (€/MWh)'].apply(lambda x: f'{x:.0f}' if x < 500 else '> 500')
                 top5_eta['Zyklen'] = top5_eta['Zyklen'].apply(lambda x: f'{x:.0f}')
-                
+
                 st.dataframe(top5_eta, use_container_width=True, hide_index=True)
-            
+
             with tab2:
                 top5_npv = results.nlargest(5, 'npv')[
-                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h', 
+                    ['storage_power_mw', 'storage_capacity_mwh', 'duration_h',
                      'capture_rate', 'npv', 'payback_years', 'break_even_price']
                 ].copy()
-                
-                top5_npv.columns = ['P (MW)', 'E (MWh)', 'E/P (h)', 
+
+                top5_npv.columns = ['P (MW)', 'E (MWh)', 'E/P (h)',
                                'Erfassung', 'NPV (€)', 'Amortisation (a)', 'Break-Even (€/MWh)']
                 top5_npv['Erfassung'] = top5_npv['Erfassung'].apply(lambda x: f'{x*100:.1f}%')
-                top5_npv['NPV (€)'] = top5_npv['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.' if x > -1e9 else '—')
+                top5_npv['NPV (€)'] = top5_npv['NPV (€)'].apply(lambda x: f'{x/1e6:.2f} Mio.')
                 top5_npv['Amortisation (a)'] = top5_npv['Amortisation (a)'].apply(lambda x: f'{x:.1f}' if x < 100 else '> 100')
                 top5_npv['Break-Even (€/MWh)'] = top5_npv['Break-Even (€/MWh)'].apply(lambda x: f'{x:.0f}' if x < 500 else '> 500')
-                
+
                 st.dataframe(top5_npv, use_container_width=True, hide_index=True)
-            
-            # Wirtschaftliche Parameter speichern für Step 5
-            st.session_state.economic_params_ps = {
-                'electricity_price': electricity_price,
-                'project_lifetime': project_lifetime_ps,
-                'discount_rate': discount_rate_ps,
-                'opex_rate': opex_rate_ps,
-                'use_da_prices': use_da_prices_for_revenue,
-                'c_E': c_E,
-                'c_P': c_P,
-            }
-    
+
     st.markdown("---")
-    
+
     # Navigation
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
@@ -5826,7 +4493,7 @@ def show_mode_c_step4():
             st.rerun()
     with col3:
         # Weiter wenn entweder Parameterstudie ODER Optimierung durchgeführt
-        has_results = (st.session_state.get('parameter_study_results') is not None or 
+        has_results = (st.session_state.get('parameter_study_results') is not None or
                       st.session_state.get('optimal_nvp_result') is not None)
         if has_results:
             if st.button("Weiter →", type="primary", use_container_width=True):
@@ -6116,11 +4783,11 @@ def show_mode_c_step5():
         opt_result = st.session_state.optimal_nvp_result
         
         # Wenn Optimierung 0 ergab, speziellen Hinweis zeigen
-        if opt_result['optimal_power_mw'] < 0.001:
+        if opt_result['optimal_power_mw'] <= 0:
             st.warning("⚠️ **Die Optimierung ergab: Kein Speicher wirtschaftlich sinnvoll**")
             st.markdown(f"""
-            Bei nur **{opt_result['total_surplus_mwh']:.0f} MWh** Überschuss pro Jahr 
-            übersteigen die Speicherkosten den Nutzen.
+            Bei **{opt_result['total_surplus_mwh']:,.0f} MWh** Überschuss im Datenzeitraum
+            deckt der Mehrerlös die Speicherkosten für keine Größe.
             
             **Ohne Speicher:**
             - Netzeinspeisung: {opt_result.get('ref_grid_feed_mwh', 0):,.0f} MWh/Jahr
@@ -6137,11 +4804,19 @@ def show_mode_c_step5():
         st.markdown("#### 📊 Optimale Speicherkonfiguration (aus automatischer Optimierung)")
         
         unit = st.session_state.get('unit_display', 'MW')
-        cost_power = st.session_state.get('cost_power', 80)
-        cost_energy = st.session_state.get('cost_energy', 200)
-        
+        # Kosten so, wie sie in der Optimierung verwendet wurden (ggf. in Schritt 4 angepasst)
+        capex_params = st.session_state.get('nvp_capex_params', {})
+        cost_power = capex_params.get('power', st.session_state.get('cost_power', 170))
+        cost_energy = capex_params.get('energy', st.session_state.get('cost_energy', 165))
+        eco = sm.nvp_economics(
+            opt_result, cost_power, cost_energy,
+            opt_result.get('opex_rate', 0.02),
+            opt_result.get('interest_rate', 0.06),
+            opt_result.get('lifetime_years', 15),
+        )
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             if unit == "kW":
                 st.metric("Speicherleistung", f"{opt_result['optimal_power_mw']*1000:.0f} kW")
@@ -6161,12 +4836,11 @@ def show_mode_c_step5():
         
         with col4:
             st.metric("Zyklen pro Jahr", f"{opt_result['cycles']:.0f}")
-            capex = (opt_result['optimal_capacity_mwh'] * 1000 * cost_energy + 
-                    opt_result['optimal_power_mw'] * 1000 * cost_power)
+            capex = eco['capex']
             st.metric("Investitionskosten", f"{capex:,.0f} €")
-        
+
         st.markdown("---")
-        
+
         # Detaillierte Simulation - Ergebnisse aus Optimierung verwenden
         st.markdown("#### 📈 Detaillierte Ergebnisse")
         
@@ -6187,63 +4861,62 @@ def show_mode_c_step5():
             st.write(f"- Abregelung: {opt_result['total_curtailment_mwh']:,.0f} MWh ({curtail_pct:.1f}%)")
             st.write(f"- Netzauslastung: {opt_result['grid_utilization']*100:.1f}%")
         
-        # Verbesserung
-        improvement = opt_result['total_grid_feed_mwh'] - ref_grid
+        # Verbesserung (auf ein Jahr hochgerechnet, nach Speicherverlusten)
+        improvement = opt_result['additional_feed_in_mwh']
         if improvement > 0:
             st.success(f"✓ Zusätzliche Einspeisung durch Speicher: {improvement:,.0f} MWh/Jahr")
+        elif eco['annual_revenue'] > 0:
+            st.info("ℹ️ Der Speicher erhöht die eingespeiste Menge nicht, verschiebt die Einspeisung aber "
+                    "in Stunden mit höheren Preisen.")
         else:
-            st.warning(f"⚠️ Keine Verbesserung durch Speicher")
-        
+            st.warning("⚠️ Keine Verbesserung durch Speicher")
+
         st.markdown("---")
-        
+
         # Wirtschaftlichkeitsrechnung
         st.markdown("#### 💰 Wirtschaftlichkeitsrechnung")
-        
-        # Parameter aus Optimierung
-        feed_in_value = opt_result.get('feed_in_value', 80)
-        annual_cost_energy = opt_result.get('annual_cost_energy', 0)
-        annual_cost_power = opt_result.get('annual_cost_power', 0)
+
         opex_rate = opt_result.get('opex_rate', 0.02)
-        
-        # Berechnung
-        additional_revenue = improvement * feed_in_value  # Zusätzlicher Erlös durch vermiedene Abregelung
-        annual_storage_cost = (opt_result['optimal_capacity_mwh'] * annual_cost_energy / 1000 + 
-                              opt_result['optimal_power_mw'] * annual_cost_power / 1000)  # €/Jahr
-        
-        net_benefit = additional_revenue - annual_storage_cost
-        
+        lifetime_years = opt_result.get('lifetime_years', 15)
+        interest_rate = opt_result.get('interest_rate', 0.06)
+
         col1, col2, col3 = st.columns(3)
-        
+
         with col1:
             st.markdown("**Erlöse (pro Jahr)**")
             st.write(f"- Zusätzliche Einspeisung: {improvement:,.0f} MWh")
-            st.write(f"- Marktwert: {feed_in_value:.0f} €/MWh")
-            st.metric("Zusätzlicher Erlös", f"{additional_revenue:,.0f} €/a")
-        
+            if eco['avg_price_used'] is not None:
+                st.write(f"- Ø Wert der Mehreinspeisung: {eco['avg_price_used']:.0f} €/MWh")
+            st.metric("Mehrerlös ggü. ohne Speicher", f"{eco['annual_revenue']:,.0f} €/a")
+
         with col2:
             st.markdown("**Kosten (pro Jahr)**")
-            capex_share = annual_cost_energy / (1 + opex_rate) if opex_rate > 0 else annual_cost_energy
-            opex_share = annual_cost_energy * opex_rate / (1 + opex_rate) if opex_rate > 0 else 0
-            st.write(f"- CAPEX (annualisiert): {opt_result.get('annual_capex_energy', capex_share):.0f} €/MWh/a")
-            st.write(f"- OPEX ({opex_rate*100:.0f}% v. CAPEX): {opt_result.get('annual_opex_energy', opex_share):.0f} €/MWh/a")
-            st.metric("Jährliche Speicherkosten", f"{annual_storage_cost:,.0f} €/a")
-        
+            st.write(f"- Annuität ({interest_rate*100:.1f} %, {lifetime_years} a): {eco['annual_capex']:,.0f} €")
+            st.write(f"- OPEX ({opex_rate*100:.1f} % v. CAPEX): {eco['annual_opex']:,.0f} €")
+            st.metric("Jährliche Speicherkosten", f"{eco['annual_cost']:,.0f} €/a")
+
         with col3:
             st.markdown("**Ergebnis**")
-            if net_benefit > 0:
+            net_benefit = eco['annual_net_benefit']
+            if net_benefit >= 0:
                 st.metric("Jährlicher Nettonutzen", f"+{net_benefit:,.0f} €/a", delta="wirtschaftlich")
             else:
                 st.metric("Jährlicher Nettonutzen", f"{net_benefit:,.0f} €/a", delta="unwirtschaftlich", delta_color="inverse")
-            
-            # Amortisation
-            capex_total = (opt_result['optimal_capacity_mwh'] * 1000 * cost_energy + 
-                          opt_result['optimal_power_mw'] * 1000 * cost_power)
-            if additional_revenue > 0:
-                simple_payback = capex_total / additional_revenue
-                st.write(f"Einfache Amortisation: {simple_payback:.1f} Jahre")
-        
+            st.write(f"Kapitalwert (NPV): {eco['npv']:,.0f} €")
+            if np.isfinite(eco['payback_years']):
+                st.write(f"Amortisation (statisch, nach OPEX): {eco['payback_years']:.1f} Jahre")
+            if np.isfinite(eco['lcos']):
+                st.write(f"LCOS: {eco['lcos']:.0f} €/MWh")
+
+        total_cycles = opt_result['cycles'] * lifetime_years
+        st.caption(f"Vollzyklen: {opt_result['cycles']:.0f}/Jahr → ca. {total_cycles:,.0f} in {lifetime_years} Jahren. "
+                   "Bitte mit der Zyklenfestigkeit des Herstellers abgleichen; Degradation und "
+                   "Ersatzinvestitionen sind nicht modelliert.")
+        if opt_result.get('has_price_profile'):
+            st.caption("Hinweis: Betrieb mit perfekter Preisvoraussicht – die Erlöse sind eine obere Schranke.")
+
         st.markdown("---")
-        
+
         # Zeitreihen visualisieren
         st.markdown("#### 📊 Zeitreihen-Visualisierung")
         
@@ -6389,8 +5062,9 @@ def show_mode_c_step5():
                 start_day = st.slider(
                     "Starttag im Jahr",
                     min_value=1,
-                    max_value=max(1, n_days_total - 7),
-                    value=st.session_state.get('start_day_c5', 150),  # Default: ca. Juni
+                    max_value=max(2, n_days_total - 7),
+                    value=int(min(max(st.session_state.get('start_day_c5', 150), 1),
+                                  max(2, n_days_total - 7))),
                     key="start_day_slider_c5",
                     help="Tag 1 = 1. Januar, Tag 180 ≈ Ende Juni"
                 )
@@ -6438,7 +5112,7 @@ def show_mode_c_step5():
             # SOC
             ax3.plot(x, opt_result['soc'][start_idx:end_idx], color='#9b59b6', linewidth=1.5)
             ax3.set_ylabel('SOC (MWh)')
-            ax3.set_xlabel(f'Zeitschritt (15 min) - Start: Tag {start_day}')
+            ax3.set_xlabel(f'Zeitschritt ({time_res["resolution"]}) - Start: Tag {start_day}')
             ax3.set_title('Speicherfüllstand')
             ax3.grid(True, alpha=0.3)
             
@@ -6461,6 +5135,14 @@ def show_mode_c_step5():
                 'cycles': opt_result['cycles'],
                 'curtailment_mwh': opt_result['total_curtailment_mwh'],
                 'surplus_mwh': opt_result['total_surplus_mwh'],
+                'capex': eco['capex'],
+                'annual_revenue': eco['annual_revenue'],
+                'annual_opex': eco['annual_opex'],
+                'npv': eco['npv'],
+                'break_even_price': eco['break_even_price'],
+                'payback_years': eco['payback_years'],
+                'lcos': eco['lcos'],
+                'additional_feed_in': eco['additional_feed_in'],
             }])
             
             # Optimale Konfiguration als Series
@@ -6550,26 +5232,30 @@ def show_mode_c_step5():
     # Simulation mit optimaler Konfiguration
     st.markdown("#### 📈 Detaillierte Simulation")
     
-    # Preisparameter abrufen
-    da_prices = st.session_state.get('da_prices_c')
-    discharge_strategy = st.session_state.get('discharge_strategy_c_val', 'immediate')
-    price_threshold = st.session_state.get('price_threshold_c_val')
-    
-    sim = simulate_nvp_storage(
-        wind_profile=st.session_state.get('wind_profile_c'),
-        pv_profile=st.session_state.get('pv_profile_c'),
-        p_nvp_mw=st.session_state.p_nvp_mw,
-        p_wind_inst_mw=st.session_state.p_wind_inst_mw,
-        p_pv_inst_mw=st.session_state.p_pv_inst_mw,
-        storage_power_mw=optimal['storage_power_mw'],
-        storage_capacity_mwh=optimal['storage_capacity_mwh'],
-        eta_charge=st.session_state.eta_charge,
-        eta_discharge=st.session_state.eta_discharge,
-        da_prices=da_prices,
-        price_threshold=price_threshold,
-        discharge_strategy=discharge_strategy,
-    )
-    
+    # Dieselbe Bewertung wie in der Parameterstudie verwenden
+    eco_ps = st.session_state.get('economic_params_ps', {})
+    da_prices = st.session_state.get('da_prices_c') if eco_ps.get('use_da_prices') else None
+
+    # Simulation nur neu rechnen, wenn sich die gewählte Konfiguration ändert
+    cache_key = (float(optimal['storage_power_mw']), float(optimal['storage_capacity_mwh']),
+                 da_prices is not None, eco_ps.get('electricity_price'))
+    cache = st.session_state.get('nvp_sim_cache')
+    if cache is not None and cache['key'] == cache_key:
+        sim = cache['sim']
+    else:
+        with st.spinner("Simuliere gewählte Konfiguration..."):
+            sim = run_model(
+                sm.simulate_nvp_storage,
+                **nvp_base_kwargs(),
+                storage_power_mw=float(optimal['storage_power_mw']),
+                storage_capacity_mwh=float(optimal['storage_capacity_mwh']),
+                da_prices=da_prices,
+                feed_in_value=eco_ps.get('electricity_price', 80.0),
+            )
+        if sim is None:
+            return
+        st.session_state.nvp_sim_cache = {'key': cache_key, 'sim': sim}
+
     # Vergleichstabelle
     col1, col2 = st.columns(2)
     
@@ -6585,25 +5271,33 @@ def show_mode_c_step5():
         st.write(f"- Abregelung: {sim['total_curtailment_mwh']:,.0f} MWh ({sim['total_curtailment_mwh']/sim['total_generation_mwh']*100:.1f}%)")
         st.write(f"- Netzauslastung: {sim['grid_utilization']*100:.1f}%")
         
-        # Erlöse anzeigen wenn Preisoptimierung aktiv
-        if da_prices is not None and sim['total_discharge_revenue'] > 0:
-            st.write(f"- **Entladeerlös: {sim['total_discharge_revenue']:,.0f} €/Jahr**")
-            if sim['avg_discharge_price'] is not None:
-                st.write(f"- Ø Entladepreis: {sim['avg_discharge_price']:.1f} €/MWh")
-    
-    # Verbesserung
-    improvement = sim['total_grid_feed_mwh'] - (surplus_analysis['total_generation'] - surplus_analysis['total_surplus'])
-    st.success(f"✓ Zusätzliche Einspeisung durch Speicher: {improvement:,.0f} MWh/Jahr")
-    
-    # Entladestrategie-Info anzeigen
-    if discharge_strategy != "immediate" and da_prices is not None:
-        if discharge_strategy == "price_threshold":
-            st.info(f"💰 Preisoptimierte Entladung: Nur bei Preisen ≥ {price_threshold:.0f} €/MWh")
-        else:
-            st.info(f"💰 Preisoptimierte Entladung: Nur im oberen {100-price_threshold:.0f}% Preisbereich des Tages")
-    
+        if sim['avg_discharge_price'] is not None:
+            st.write(f"- Ø Preis bei Entladung: {sim['avg_discharge_price']:.1f} €/MWh")
+
+    # Verbesserung (auf ein Jahr hochgerechnet, nach Speicherverlusten)
+    improvement = sim['additional_feed_in_mwh']
+    st.success(f"✓ Zusätzliche Einspeisung durch Speicher: {improvement:,.0f} MWh/Jahr "
+               f"(Mehrerlös: {sim['additional_revenue']:,.0f} €/Jahr)")
+
+    # Wirtschaftlichkeit der gewählten Konfiguration (aus der Parameterstudie)
+    if 'npv' in optimal.index:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Kapitalwert (NPV)", f"{optimal['npv']:,.0f} €")
+        with col2:
+            st.metric("Amortisation", f"{optimal['payback_years']:.1f} Jahre"
+                      if np.isfinite(optimal['payback_years']) else "nie")
+        with col3:
+            st.metric("Break-Even-Preis", f"{optimal['break_even_price']:.0f} €/MWh"
+                      if np.isfinite(optimal['break_even_price']) else "–")
+        with col4:
+            st.metric("LCOS", f"{optimal['lcos']:.0f} €/MWh" if np.isfinite(optimal['lcos']) else "–")
+
+    if da_prices is not None:
+        st.caption("Hinweis: Betrieb mit perfekter Preisvoraussicht – die Erlöse sind eine obere Schranke.")
+
     st.markdown("---")
-    
+
     # Beispielwoche visualisieren
     st.markdown("#### 📊 Zeitreihen-Visualisierung")
     
@@ -6759,8 +5453,8 @@ def show_mode_c_step5():
             start_day = st.slider(
                 "Starttag im Jahr",
                 min_value=1,
-                max_value=max(1, n_days_total - 7),
-                value=150,  # Default: ca. Juni
+                max_value=max(2, n_days_total - 7),
+                value=min(150, max(2, n_days_total - 7)),
                 key="start_day_ps",
                 help="Tag 1 = 1. Januar"
             )
@@ -6824,10 +5518,6 @@ def show_mode_c_step5():
             prices_plot = sim['prices'][start_idx:end_idx] if sim['prices'] is not None else da_prices.values[start_idx:end_idx]
             ax4.plot(x, prices_plot, color='#f39c12', linewidth=1, label='Day-Ahead-Preis')
             
-            if discharge_strategy == "price_threshold" and price_threshold is not None:
-                ax4.axhline(y=price_threshold, color='#e74c3c', linestyle='--', 
-                           label=f'Schwellwert ({price_threshold:.0f} €/MWh)')
-            
             discharge_mask = sim['p_discharge'][start_idx:end_idx] > 0
             if discharge_mask.any():
                 ax4.fill_between(x, 0, prices_plot, where=discharge_mask, 
@@ -6867,21 +5557,20 @@ def show_mode_c_step5():
             "erfassungsgrad": optimal['capture_rate'],
             "netzauslastung": sim['grid_utilization'],
             "zyklen_pro_jahr": optimal['cycles'],
-            "zusaetzliche_einspeisung_mwh": improvement,
+            "zusaetzliche_einspeisung_mwh_pro_jahr": improvement,
+            "mehrerloes_eur_pro_jahr": sim['additional_revenue'],
+            "npv_eur": float(optimal['npv']) if 'npv' in optimal.index else None,
         },
     }
     
     # Erlösdaten hinzufügen wenn Preise vorhanden
     if da_prices is not None:
-        export_data["entladestrategie"] = {
-            "strategie": discharge_strategy,
-            "schwellwert": price_threshold,
-        }
         export_data["erloese"] = {
-            "entladeerlos_eur": sim['total_discharge_revenue'],
+            "betrieb": "preisoptimiert (perfekte Voraussicht)",
+            "entladeerloes_eur": sim['total_discharge_revenue'],
             "durchschnittlicher_entladepreis_eur_mwh": sim['avg_discharge_price'],
         }
-    
+
     col1, col2 = st.columns(2)
     
     with col1:
@@ -6927,8 +5616,26 @@ def show_mode_c_step5():
 # =============================================================================
 # Hauptprogramm
 # =============================================================================
+def keep_widget_state():
+    """
+    Streamlit löscht den Wert eines Widgets, sobald es in einem Durchlauf nicht
+    mehr gezeichnet wird (z.B. nach "Weiter"). Dadurch gingen Eingaben beim
+    Zurückblättern verloren und Abfragen wie has_pv_b in späteren Schritten
+    lieferten wieder den Standardwert. Durch das erneute Zuweisen bleiben die
+    Werte erhalten. Buttons und Datei-Uploads dürfen nicht gesetzt werden.
+    """
+    for key in list(st.session_state.keys()):
+        if not isinstance(key, str):
+            continue
+        if "upload" in key or key.endswith("_btn") or key.startswith("dl_"):
+            continue
+        st.session_state[key] = st.session_state[key]
+
+
 def main():
     """Hauptfunktion der Anwendung."""
+    
+    keep_widget_state()
     
     # Sidebar
     with st.sidebar:

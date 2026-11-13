@@ -1,0 +1,31 @@
+# =============================================================================
+# Online aufrufen unter: https://batteriespeicher-tool.streamlit.app/
+# =============================================================================
+# Batteriespeicher-Optimierungstool - Abhängigkeiten
+# =============================================================================
+# Installation: pip install -r requirements.txt
+#
+# Die Versionen von streamlit, pypsa, linopy und highspy sind bewusst fest
+# gesetzt: Mit genau diesen Versionen wurde das Tool getestet. Offene Angaben
+# wie "pypsa>=0.26" installieren bei jedem neuen Deployment die neueste
+# Version (inzwischen PyPSA 1.x mit geänderter API) – das Tool kann dann ohne
+# Codeänderung brechen oder andere Ergebnisse liefern.
+# =============================================================================
+
+# Kernbibliotheken
+numpy>=1.26,<3
+pandas>=2.0,<3
+
+# Visualisierung
+matplotlib>=3.7
+
+# Web-Oberfläche
+streamlit==1.51.0
+
+# Excel-Unterstützung
+openpyxl>=3.1
+
+# Optimierung
+pypsa==0.35.1
+linopy==0.5.5
+highspy==1.11.0  # HiGHS Solver für lineare Optimierung
